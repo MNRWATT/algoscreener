@@ -1,23 +1,15 @@
 import yahooFinance from "yahoo-finance2";
 
-// Suppress yahoo-finance2 validation notices/errors that cause throws
-yahooFinance.setGlobalConfig({
-  validation: {
-    logErrors: false,
-    logNotices: false,
-  },
-});
-
 export async function getLiveQuote(ticker: string) {
   try {
     const quote = await yahooFinance.quote(ticker, {}, { validateResult: false });
     if (!quote) throw new Error(`No data returned for ${ticker}`);
     return {
-      price: quote.regularMarketPrice ?? null,
-      change: quote.regularMarketChange ?? null,
-      changePercent: quote.regularMarketChangePercent ?? null,
-      volume: quote.regularMarketVolume ?? null,
-      marketCap: quote.marketCap ?? null,
+      price: (quote as any).regularMarketPrice ?? null,
+      change: (quote as any).regularMarketChange ?? null,
+      changePercent: (quote as any).regularMarketChangePercent ?? null,
+      volume: (quote as any).regularMarketVolume ?? null,
+      marketCap: (quote as any).marketCap ?? null,
       name: (quote as any).shortName || (quote as any).longName || ticker,
     };
   } catch (err) {
