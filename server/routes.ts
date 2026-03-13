@@ -3,7 +3,7 @@ import { createServer, type Server } from "http";
 import { getScreenedStocks, SECTORS, EXCHANGES, getStockDetail, runBacktest, getSectorHeatmap, getAllStocks, computeComposite, buildPortfolio } from "./stockData";
 import type { MarketRegime, PresetStrategy, WatchlistItem, Alert, AlertRule, FactorWeights } from "@shared/schema";
 import { randomUUID } from "crypto";
-import { getLiveQuote, getLiveQuotes, getCachedQuote } from "./marketData";
+import { getLiveQuotes, getCachedQuote } from "./marketData";
 
 // ─── Preset Strategies ─────────────────────────────────────────────
 
@@ -102,13 +102,12 @@ function getMarketRegime(): MarketRegime {
   };
 }
 
-// ─── In-Memory Storage (no localStorage in iframe) ─────────────────
+// ─── In-Memory Storage ─────────────────────────────────────────────
 
 const watchlist: Map<string, WatchlistItem> = new Map();
 const alerts: Alert[] = [];
 const alertRules: AlertRule[] = [];
 
-// Seed some default alerts for demo
 function seedDemoAlerts() {
   const defaultWeights: FactorWeights = { momentum: 30, quality: 25, lowVol: 20, valuation: 10, erm: 10, insider: 5 };
   const stocks = getScreenedStocks(defaultWeights);
@@ -156,13 +155,26 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
 
-  // ─── Existing endpoints ────────────────────────────────────────
-
-  app.get("/api/screener", (req, res) => {
+  // ─── Screener (with live prices) ──────────────────────────────
+  app.get("/api/screener", async (req, res) => {
     const weights = parseWeights(req.query as Record<string, unknown>);
     const stocks = getScreenedStocks(weights);
+    const tickers = stocks.map((s) => s.ticker);
+    const liveQuotes = await getLiveQuotes(tickers);
+    const enriched = stocks.map((stock, i) => {
+      const live = liveQuotes[i];
+      return {
+        ...stock,
+        price: live?.price ?? stock.price,
+        change: live?.change ?? stock.change,
+        changePercent: live?.changePercent ?? stock.changePercent,
+        volume: live?.volume ?? stock.volume,
+        marketCap: live?.marketCap ?? stock.marketCap,
+        name: live?.name ?? stock.name,
+      };
+    });
     res.json({
-      stocks,
+      stocks: enriched,
       lastUpdated: new Date().toISOString(),
       universe: "TSX + S&P 500 + NASDAQ 100 + DOW 30",
     });
@@ -184,9 +196,8 @@ export async function registerRoutes(
     res.json(PRESETS);
   });
 
-  // ─── Stock Detail ──────────────────────────────────────────────
-
-  app.get("/api/stock/:ticker", (req, res) => {
+  // ─── Stock Detail (with live prices) ──────────────────────────
+  app.get("/api/stock/:ticker", async (req, res) => {
     const { ticker } = req.params;
     const weights = parseWeights(req.query as Record<string, unknown>);
     const detail = getStockDetail(ticker, weights);
@@ -194,38 +205,39 @@ export async function registerRoutes(
       res.status(404).json({ error: "Stock not found" });
       return;
     }
-    res.json(detail);
-  });
-  
-  app.get("/api/stock/:ticker", (req, res) => {
-  const { ticker } = req.params;
-  const weights = parseWeights(req.query as Record<string, unknown>);
-  const detail = getStockDetail(ticker, weights);
-  if (!detail) {
-    res.status(404).json({ error: "Stock not found" });
-    return;
-  }
-  res.json(detail);
-});
-
-// New live quote endpoint using Yahoo Finance
-  app.get("/api/quote/:ticker", async (req, res) => {
-  try {
-    const { ticker } = req.params;
-    const quote = await getCachedQuote(ticker);
-    if (!quote) {
-      res.status(404).json({ error: "Quote not found" });
-      return;
+    try {
+      const live = await getCachedQuote(ticker);
+      res.json({
+        ...detail,
+        price: live?.price ?? detail.price,
+        change: live?.change ?? detail.change,
+        changePercent: live?.changePercent ?? detail.changePercent,
+        volume: live?.volume ?? detail.volume,
+        marketCap: live?.marketCap ?? detail.marketCap,
+        name: live?.name ?? detail.name,
+      });
+    } catch {
+      res.json(detail);
     }
-    res.json(quote);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch quote" });
-  }
-});
+  });
+
+  // ─── Live Quote ────────────────────────────────────────────────
+  app.get("/api/quote/:ticker", async (req, res) => {
+    try {
+      const { ticker } = req.params;
+      const quote = await getCachedQuote(ticker);
+      if (!quote) {
+        res.status(404).json({ error: "Quote not found" });
+        return;
+      }
+      res.json(quote);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Failed to fetch quote" });
+    }
+  });
 
   // ─── Backtesting ───────────────────────────────────────────────
-
   app.get("/api/backtest", (req, res) => {
     const weights = parseWeights(req.query as Record<string, unknown>);
     const period = (req.query.period as string) || "1y";
@@ -238,7 +250,6 @@ export async function registerRoutes(
   });
 
   // ─── Portfolio ─────────────────────────────────────────────────
-
   app.get("/api/portfolio", (req, res) => {
     const weights = parseWeights(req.query as Record<string, unknown>);
     const portfolio = buildPortfolio(weights);
@@ -246,7 +257,6 @@ export async function registerRoutes(
   });
 
   // ─── Sector Heatmap ────────────────────────────────────────────
-
   app.get("/api/heatmap", (req, res) => {
     const weights = parseWeights(req.query as Record<string, unknown>);
     const heatmap = getSectorHeatmap(weights);
@@ -254,7 +264,6 @@ export async function registerRoutes(
   });
 
   // ─── Watchlist ─────────────────────────────────────────────────
-
   app.get("/api/watchlist", (_req, res) => {
     const items = Array.from(watchlist.values());
     res.json(items);
@@ -262,7 +271,6 @@ export async function registerRoutes(
 
   app.post("/api/watchlist/:ticker", (req, res) => {
     const { ticker } = req.params;
-    // Verify stock exists
     const stock = getAllStocks().find((s) => s.ticker === ticker);
     if (!stock) {
       res.status(404).json({ error: "Stock not found" });
@@ -283,7 +291,6 @@ export async function registerRoutes(
   });
 
   // ─── Alerts ────────────────────────────────────────────────────
-
   app.get("/api/alerts", (_req, res) => {
     res.json(alerts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
   });
@@ -309,7 +316,7 @@ export async function registerRoutes(
     res.json({ message: "Alert deleted" });
   });
 
-  // Alert rules
+  // ─── Alert Rules ───────────────────────────────────────────────
   app.get("/api/alert-rules", (_req, res) => {
     res.json(alertRules);
   });
@@ -324,7 +331,6 @@ export async function registerRoutes(
     };
     alertRules.push(rule);
 
-    // Generate an immediate alert if condition already met
     if (rule.type === "score_above" && rule.ticker && rule.threshold) {
       const defaultWeights: FactorWeights = { momentum: 30, quality: 25, lowVol: 20, valuation: 10, erm: 10, insider: 5 };
       const stock = getAllStocks().find((s) => s.ticker === rule.ticker);
@@ -343,7 +349,6 @@ export async function registerRoutes(
         }
       }
     }
-
     res.json(rule);
   });
 
