@@ -1,4 +1,5 @@
 import yahooFinance from "yahoo-finance2";
+import { getAllStocks } from "./stockData";
 
 export interface LiveQuote {
   price: number | null;
@@ -15,6 +16,7 @@ const CACHE_TTL = 15 * 60 * 1000;
 export async function getLiveQuote(ticker: string): Promise<LiveQuote | null> {
   try {
     const quote = await yahooFinance.quote(ticker);
+    if (!quote) return null;
     return {
       price: quote.regularMarketPrice ?? null,
       change: quote.regularMarketChange ?? null,
@@ -41,7 +43,19 @@ export async function getCachedQuotes(tickers: string[]): Promise<Map<string, Li
   for (let i = 0; i < tickers.length; i += 20) {
     const batch = tickers.slice(i, i + 20);
     await Promise.all(batch.map(async (t) => { results.set(t, await getCachedQuote(t)); }));
-    if (i + 20 < tickers.length) await new Promise((r) => setTimeout(r, 100));
+    if (i + 20 < tickers.length) await new Promise((r) => setTimeout(r, 150));
   }
   return results;
+}
+
+// Pre-warm: fetch all tickers in background after server starts
+export async function prewarmCache(): Promise<void> {
+  const tickers = getAllStocks().map((s) => s.ticker);
+  console.log(`[prewarm] Starting cache warm for ${tickers.length} tickers...`);
+  try {
+    await getCachedQuotes(tickers);
+    console.log(`[prewarm] Cache warm complete.`);
+  } catch (err) {
+    console.warn("[prewarm] Cache warm encountered errors (non-fatal):", err);
+  }
 }
