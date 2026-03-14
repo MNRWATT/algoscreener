@@ -18,9 +18,9 @@ export interface StockScore {
   name: string;
   sector: string;
   exchange: string;
-  price: number;
-  change1d: number;
-  marketCap: number;
+  price: number | null;
+  change1d: number | null;
+  marketCap: number | null;
   // Raw factor scores (0-100)
   momentum: number;
   quality: number;
@@ -101,9 +101,9 @@ export interface WatchlistItem {
 // ─── Backtesting ──────────────────────────────────────────────
 
 export interface BacktestPoint {
-  month: string; // YYYY-MM
+  month: string;
   portfolioValue: number;
-  benchmarkValue: number; // S&P 500
+  benchmarkValue: number;
 }
 
 export interface BacktestHolding {
@@ -111,10 +111,10 @@ export interface BacktestHolding {
   name: string;
   sector: string;
   exchange: string;
-  weight: number; // percentage of portfolio
+  weight: number;
   compositeScore: number;
-  returnContribution: number; // percentage points contributed to total return
-  totalReturn: number; // individual stock total return over period
+  returnContribution: number;
+  totalReturn: number;
 }
 
 export interface BacktestResult {
@@ -130,7 +130,7 @@ export interface BacktestResult {
   alpha: number;
   holdings: BacktestHolding[];
   holdingCount: number;
-  weightingMethod: "score-weighted"; // top stocks weighted by composite score
+  weightingMethod: "score-weighted";
   rebalanceFrequency: "monthly";
   sectorBreakdown: { sector: string; weight: number }[];
   exchangeBreakdown: { exchange: string; weight: number }[];
@@ -143,13 +143,12 @@ export interface PortfolioHolding {
   name: string;
   sector: string;
   exchange: string;
-  price: number;
-  change1d: number;
+  price: number | null;
+  change1d: number | null;
   compositeScore: number;
-  weight: number; // percentage
-  shares: number; // notional shares at $10k portfolio
+  weight: number;
+  shares: number;
   marketValue: number;
-  // Factor scores for detail
   momentum: number;
   quality: number;
   lowVol: number;
@@ -170,7 +169,7 @@ export interface PortfolioSummary {
   sectorBreakdown: { sector: string; weight: number; count: number }[];
   exchangeBreakdown: { exchange: string; weight: number; count: number }[];
   topHolding: { ticker: string; weight: number };
-  top5Weight: number; // concentration of top 5
+  top5Weight: number;
 }
 
 // ─── Sector Heatmap ───────────────────────────────────────────
@@ -180,8 +179,8 @@ export interface HeatmapCell {
   name: string;
   sector: string;
   composite: number;
-  change1d: number;
-  marketCap: number;
+  change1d: number | null;
+  marketCap: number | null;
 }
 
 export interface HeatmapSector {
@@ -197,8 +196,8 @@ export type AlertType = "score_above" | "score_below" | "regime_change";
 export interface Alert {
   id: string;
   type: AlertType;
-  ticker?: string; // for score alerts
-  threshold?: number; // composite score threshold
+  ticker?: string;
+  threshold?: number;
   message: string;
   createdAt: string;
   read: boolean;
@@ -237,7 +236,6 @@ export interface StockDetail extends StockScore {
   description: string;
 }
 
-// Generic user/insert types (template boilerplate)
 export interface User {
   id: string;
   username: string;
