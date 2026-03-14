@@ -1,24 +1,47 @@
 import yahooFinance from "yahoo-finance2";
-export async function getLiveQuote(ticker: string) {
-const quote = await yahooFinance.quote(ticker);
-return {
-price: quote.regularMarketPrice,
-change: quote.regularMarketChange,
-changePercent: quote.regularMarketChangePercent,
-volume: quote.regularMarketVolume,
-marketCap: quote.marketCap,
-name: quote.shortName || quote.longName,
-};
+
+export interface LiveQuote {
+  price: number | null;
+  change: number | null;
+  changePercent: number | null;
+  volume: number | null;
+  marketCap: number | null;
+  name: string | null;
 }
-export async function getLiveQuotes(tickers: string[]) {
-// Fetch in batches of 20 to avoid rate limits
-const results = [];
-for (let i = 0; i < tickers.length; i += 20) {
-const batch = tickers.slice(i, i + 20);
-const quotes = await Promise.all(
-batch.map(t => getLiveQuote(t).catch(() => null))
-);
-results.push(...quotes);
+
+const cache = new Map<string, { data: LiveQuote; ts: number }>();
+const CACHE_TTL = 15 * 60 * 1000;
+
+export async function getLiveQuote(ticker: string): Promise<LiveQuote | null> {
+  try {
+    const quote = await yahooFinance.quote(ticker);
+    return {
+      price: quote.regularMarketPrice ?? null,
+      change: quote.regularMarketChange ?? null,
+      changePercent: quote.regularMarketChangePercent ?? null,
+      volume: quote.regularMarketVolume ?? null,
+      marketCap: quote.marketCap ?? null,
+      name: quote.shortName ?? quote.longName ?? null,
+    };
+  } catch {
+    return null;
+  }
 }
-return results;
+
+export async function getCachedQuote(ticker: string): Promise<LiveQuote | null> {
+  const cached = cache.get(ticker);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.data;
+  const data = await getLiveQuote(ticker);
+  if (data !== null) cache.set(ticker, { data, ts: Date.now() });
+  return data;
+}
+
+export async function getCachedQuotes(tickers: string[]): Promise<Map<string, LiveQuote | null>> {
+  const results = new Map<string, LiveQuote | null>();
+  for (let i = 0; i < tickers.length; i += 20) {
+    const batch = tickers.slice(i, i + 20);
+    await Promise.all(batch.map(async (t) => { results.set(t, await getCachedQuote(t)); }));
+    if (i + 20 < tickers.length) await new Promise((r) => setTimeout(r, 100));
+  }
+  return results;
 }
