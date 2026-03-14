@@ -31,6 +31,7 @@ interface StockDef {
   exchange: string;
 }
 
+// TSX_STOCKS kept for potential future use, but not included in ALL_STOCKS so the live universe is US-only
 const TSX_STOCKS: StockDef[] = [
   { ticker: "RY.TO", name: "Royal Bank of Canada", sector: "Financials", exchange: "TSX" },
   { ticker: "TD.TO", name: "Toronto-Dominion Bank", sector: "Financials", exchange: "TSX" },
@@ -239,7 +240,8 @@ const SP500_STOCKS: StockDef[] = [
   { ticker: "GD", name: "General Dynamics", sector: "Industrials", exchange: "NYSE" },
 ];
 
-const ALL_STOCKS: StockDef[] = [...TSX_STOCKS, ...SP500_STOCKS];
+// Live universe is US-only (S&P 500 + select US names)
+const ALL_STOCKS: StockDef[] = [...SP500_STOCKS];
 
 // ─── Factor scoring with realistic distributions ────────────────
 
@@ -263,12 +265,12 @@ function generateStockScore(def: StockDef): StockScore {
   const profile = SECTOR_PROFILES[def.sector] || { betaBase: 1.0, qualityBias: 0, volBias: 0, valueBias: 0 };
 
   // Price generation (realistic ranges)
-  const priceBase = def.exchange === "TSX" ? 40 + rng() * 160 : 50 + rng() * 450;
+  const priceBase = 50 + rng() * 450;
   const price = round(priceBase);
   const change1d = round((rng() - 0.48) * 6, 2); // Slight positive bias
 
   // Market cap (billions)
-  const mcBase = def.exchange === "TSX" ? 5 + rng() * 80 : 10 + rng() * 800;
+  const mcBase = 10 + rng() * 800;
   const marketCap = round(mcBase, 1);
 
   // ─── Raw metrics ───
@@ -401,7 +403,8 @@ export const SECTORS = [
   "Real Estate",
 ];
 
-export const EXCHANGES = ["TSX", "NYSE", "NASDAQ"];
+// US-only exchanges
+export const EXCHANGES = ["NYSE", "NASDAQ"];
 
 // ─── Price History Generator (deterministic) ────────────────────
 
@@ -473,10 +476,6 @@ const STOCK_DESCRIPTIONS: Record<string, string> = {
   "AMZN": "E-commerce, cloud computing (AWS), digital advertising, and streaming (Prime Video).",
   "GOOGL": "Search, digital advertising, cloud (GCP), Android OS, and Waymo autonomous vehicles.",
   "META": "Social media (Facebook, Instagram, WhatsApp), digital advertising, and metaverse (Reality Labs).",
-  "RY.TO": "Canada's largest bank by market cap. Full-service banking, wealth management, and capital markets.",
-  "TD.TO": "Major Canadian bank with significant US presence. Retail and commercial banking across North America.",
-  "SHOP.TO": "E-commerce platform enabling merchants worldwide. SaaS-based with payments, shipping, and fulfillment.",
-  "ENB.TO": "Largest energy infrastructure company in North America. Pipelines, gas distribution, and renewables.",
 };
 
 export function getStockDetail(ticker: string, weights: FactorWeights): StockDetail | null {
