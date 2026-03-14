@@ -68,5 +68,51 @@ export async function getCachedQuote(ticker: string): Promise<LiveQuote | null> 
   const cached = cache.get(ticker);
   if (cached && now - cached.ts < CACHE_TTL) return cached.data;
 
-  const data =
+  const data = await fetchFinnhubQuote(ticker);
+  if (data) {
+    cache.set(ticker, { data, ts: now });
+  }
+  return data;
+}
+
+export async function getCachedQuotes(
+  tickers: string[],
+): Promise<Map<string, LiveQuote | null>> {
+  const results = new Map<string, LiveQuote | null>();
+
+  for (const t of tickers) {
+    results.set(t, await getCachedQuote(t));
+  }
+
+  return results;
+}
+
+// Pre-warm: fetch a limited subset of tickers in background after server starts
+// to avoid exhausting Finnhub free-tier limits.
+export async function prewarmCache(): Promise<void> {
+  const allTickers = getAllStocks().map((s) => s.ticker);
+  const tickers = allTickers.slice(0, 50); // warm top 50 only
+  console.log(
+    `[prewarm] Starting Finnhub cache warm for ${tickers.length} tickers...`,
+  );
+
+  if (!FINNHUB_API_KEY) {
+    console.warn("[finnhub] FINNHUB_API_KEY not set; skipping prewarm");
+    return;
+  }
+
+  try {
+    for (const t of tickers) {
+      await getCachedQuote(t);
+      // Small delay between calls to respect rate limits
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    console.log("[prewarm] Finnhub cache warm complete.");
+  } catch (err) {
+    console.warn(
+      "[prewarm] Finnhub cache warm encountered errors (non-fatal):",
+      err,
+    );
+  }
+}
 
