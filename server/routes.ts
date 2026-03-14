@@ -139,7 +139,7 @@ seedDemoAlerts();
 
 // ─── Parse Weights Helper ──────────────────────────────────────────
 
-function parseWeights(query: Record<string, unknown>): FactorWeights {
+function parseWeights(query: Record<string, string>): FactorWeights {
   return {
     momentum: Number(query.momentum ?? 30),
     quality: Number(query.quality ?? 25),
@@ -155,30 +155,35 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
 
-  // ─── Screener (with live prices) ──────────────────────────────
+  // ─── Screener ──────────────────────────────────────────────────
+
   app.get("/api/screener", async (req, res) => {
-    const weights = parseWeights(req.query as Record<string, unknown>);
+    const weights = parseWeights(req.query as Record<string, string>);
     const stocks = getScreenedStocks(weights);
     const tickers = stocks.map((s) => s.ticker);
+
     const liveQuotes = await getLiveQuotes(tickers);
+
     const enriched = stocks.map((stock, i) => {
       const live = liveQuotes[i];
+      if (!live) {
+        return { ...stock, price: null, change1d: null, error: "Yahoo fetch failed" };
+      }
       return {
         ...stock,
-        price: live?.price ?? stock.price,
-        change: live?.change ?? stock.change,
-        changePercent: live?.changePercent ?? stock.changePercent,
-        volume: live?.volume ?? stock.volume,
-        marketCap: live?.marketCap ?? stock.marketCap,
-        name: live?.name ?? stock.name,
+        price: live.price,
+        change1d: live.changePercent,
       };
     });
+
     res.json({
       stocks: enriched,
       lastUpdated: new Date().toISOString(),
       universe: "TSX + S&P 500 + NASDAQ 100 + DOW 30",
     });
   });
+
+  // ─── Sectors / Exchanges ───────────────────────────────────────
 
   app.get("/api/sectors", (_req, res) => {
     res.json(SECTORS);
@@ -188,40 +193,43 @@ export async function registerRoutes(
     res.json(EXCHANGES);
   });
 
+  // ─── Market Regime ─────────────────────────────────────────────
+
   app.get("/api/market-regime", (_req, res) => {
     res.json(getMarketRegime());
   });
+
+  // ─── Presets ───────────────────────────────────────────────────
 
   app.get("/api/presets", (_req, res) => {
     res.json(PRESETS);
   });
 
-  // ─── Stock Detail (with live prices) ──────────────────────────
+  // ─── Stock Detail ──────────────────────────────────────────────
+
   app.get("/api/stock/:ticker", async (req, res) => {
     const { ticker } = req.params;
-    const weights = parseWeights(req.query as Record<string, unknown>);
+    const weights = parseWeights(req.query as Record<string, string>);
     const detail = getStockDetail(ticker, weights);
     if (!detail) {
       res.status(404).json({ error: "Stock not found" });
       return;
     }
-    try {
-      const live = await getCachedQuote(ticker);
-      res.json({
-        ...detail,
-        price: live?.price ?? detail.price,
-        change: live?.change ?? detail.change,
-        changePercent: live?.changePercent ?? detail.changePercent,
-        volume: live?.volume ?? detail.volume,
-        marketCap: live?.marketCap ?? detail.marketCap,
-        name: live?.name ?? detail.name,
-      });
-    } catch {
-      res.json(detail);
+
+    const live = await getCachedQuote(ticker);
+    if (!live) {
+      res.status(502).json({ error: `Live quote unavailable for ${ticker}` });
+      return;
     }
+
+    detail.price = live.price;
+    detail.change1d = live.changePercent;
+
+    res.json(detail);
   });
 
   // ─── Live Quote ────────────────────────────────────────────────
+
   app.get("/api/quote/:ticker", async (req, res) => {
     try {
       const { ticker } = req.params;
@@ -238,8 +246,9 @@ export async function registerRoutes(
   });
 
   // ─── Backtesting ───────────────────────────────────────────────
+
   app.get("/api/backtest", (req, res) => {
-    const weights = parseWeights(req.query as Record<string, unknown>);
+    const weights = parseWeights(req.query as Record<string, string>);
     const period = (req.query.period as string) || "1y";
     if (!["1y", "3y", "5y"].includes(period)) {
       res.status(400).json({ error: "Invalid period. Use 1y, 3y, or 5y" });
@@ -250,20 +259,23 @@ export async function registerRoutes(
   });
 
   // ─── Portfolio ─────────────────────────────────────────────────
+
   app.get("/api/portfolio", (req, res) => {
-    const weights = parseWeights(req.query as Record<string, unknown>);
+    const weights = parseWeights(req.query as Record<string, string>);
     const portfolio = buildPortfolio(weights);
     res.json(portfolio);
   });
 
   // ─── Sector Heatmap ────────────────────────────────────────────
+
   app.get("/api/heatmap", (req, res) => {
-    const weights = parseWeights(req.query as Record<string, unknown>);
+    const weights = parseWeights(req.query as Record<string, string>);
     const heatmap = getSectorHeatmap(weights);
     res.json(heatmap);
   });
 
   // ─── Watchlist ─────────────────────────────────────────────────
+
   app.get("/api/watchlist", (_req, res) => {
     const items = Array.from(watchlist.values());
     res.json(items);
@@ -291,72 +303,18 @@ export async function registerRoutes(
   });
 
   // ─── Alerts ────────────────────────────────────────────────────
+
   app.get("/api/alerts", (_req, res) => {
     res.json(alerts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
   });
 
   app.post("/api/alerts/read/:id", (req, res) => {
     const alert = alerts.find((a) => a.id === req.params.id);
-    if (alert) {
-      alert.read = true;
-    }
+    if (alert) alert.read = true;
     res.json({ message: "Alert marked as read" });
   });
 
   app.post("/api/alerts/read-all", (_req, res) => {
-    for (const a of alerts) {
-      a.read = true;
-    }
-    res.json({ message: "All alerts marked as read" });
-  });
+    for (const a of alerts) a.read = true;
+    res.json({ message: "All alerts marked as read"
 
-  app.delete("/api/alerts/:id", (req, res) => {
-    const idx = alerts.findIndex((a) => a.id === req.params.id);
-    if (idx >= 0) alerts.splice(idx, 1);
-    res.json({ message: "Alert deleted" });
-  });
-
-  // ─── Alert Rules ───────────────────────────────────────────────
-  app.get("/api/alert-rules", (_req, res) => {
-    res.json(alertRules);
-  });
-
-  app.post("/api/alert-rules", (req, res) => {
-    const rule: AlertRule = {
-      id: randomUUID(),
-      type: req.body.type || "score_above",
-      ticker: req.body.ticker,
-      threshold: req.body.threshold || 70,
-      enabled: true,
-    };
-    alertRules.push(rule);
-
-    if (rule.type === "score_above" && rule.ticker && rule.threshold) {
-      const defaultWeights: FactorWeights = { momentum: 30, quality: 25, lowVol: 20, valuation: 10, erm: 10, insider: 5 };
-      const stock = getAllStocks().find((s) => s.ticker === rule.ticker);
-      if (stock) {
-        const composite = computeComposite(stock, defaultWeights);
-        if (composite >= rule.threshold) {
-          alerts.push({
-            id: randomUUID(),
-            type: "score_above",
-            ticker: rule.ticker,
-            threshold: rule.threshold,
-            message: `${rule.ticker} composite score is ${composite} (threshold: ${rule.threshold})`,
-            createdAt: new Date().toISOString(),
-            read: false,
-          });
-        }
-      }
-    }
-    res.json(rule);
-  });
-
-  app.delete("/api/alert-rules/:id", (req, res) => {
-    const idx = alertRules.findIndex((r) => r.id === req.params.id);
-    if (idx >= 0) alertRules.splice(idx, 1);
-    res.json({ message: "Rule deleted" });
-  });
-
-  return httpServer;
-}
