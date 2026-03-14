@@ -1122,7 +1122,13 @@ function StockRow({
   onToggle: () => void;
   onWatchlistToggle: () => void;
 }) {
-  const changeColor = stock.change1d >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400";
+  const change = stock.change1d;
+  const changeColor =
+    change == null
+      ? "text-muted-foreground"
+      : change >= 0
+        ? "text-emerald-600 dark:text-emerald-400"
+        : "text-red-600 dark:text-red-400";
 
   const compositeColor =
     stock.composite >= 70 ? "text-emerald-600 dark:text-emerald-400" :
@@ -1153,12 +1159,20 @@ function StockRow({
             <span className="text-[10px] text-muted-foreground truncate max-w-[160px]">{stock.name}</span>
           </div>
         </td>
-        <td className="px-3 py-2 text-right text-sm tabular-nums font-medium cursor-pointer" onClick={onToggle}>${stock.price.toLocaleString()}</td>
-        <td className={`px-3 py-2 text-right text-sm tabular-nums font-medium cursor-pointer ${changeColor}`} onClick={onToggle}>
-          {stock.change1d >= 0 ? "+" : ""}{stock.change1d}%
+        <td className="px-3 py-2 text-right text-sm tabular-nums font-medium cursor-pointer" onClick={onToggle}>
+          {stock.price == null ? "-" : `$${stock.price.toLocaleString()}`}
         </td>
-        <td className="px-3 py-2 text-right text-xs tabular-nums text-muted-foreground hidden md:table-cell cursor-pointer" onClick={onToggle}>
-          ${stock.marketCap.toFixed(1)}B
+        <td
+          className={`px-3 py-2 text-right text-sm tabular-nums font-medium cursor-pointer ${changeColor}`}
+          onClick={onToggle}
+        >
+          {change == null ? "-" : `${change > 0 ? "+" : ""}${change}%`}
+        </td>
+        <td
+          className="px-3 py-2 text-right text-xs tabular-nums text-muted-foreground hidden md:table-cell cursor-pointer"
+          onClick={onToggle}
+        >
+          {stock.marketCap == null ? "-" : `$${stock.marketCap.toFixed(1)}B`}
         </td>
         {FACTORS.map((f) => {
           const val = stock[f.key as keyof StockScore] as number;
