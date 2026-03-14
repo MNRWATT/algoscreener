@@ -752,6 +752,9 @@ export default function ScreenerPage() {
     if (!data?.stocks) return [];
     let stocks = data.stocks;
 
+    // Restrict screener universe to NYSE + NASDAQ only
+    stocks = stocks.filter((s) => s.exchange === "NYSE" || s.exchange === "NASDAQ");
+
     if (search) {
       const q = search.toLowerCase();
       stocks = stocks.filter(
@@ -1130,6 +1133,9 @@ function StockRow({
         ? "text-emerald-600 dark:text-emerald-400"
         : "text-red-600 dark:text-red-400";
 
+  const formattedChange =
+    change == null ? "-" : `${change > 0 ? "+" : ""}${change.toFixed(2)}%`;
+
   const compositeColor =
     stock.composite >= 70 ? "text-emerald-600 dark:text-emerald-400" :
     stock.composite >= 50 ? "text-foreground" :
@@ -1166,7 +1172,7 @@ function StockRow({
           className={`px-3 py-2 text-right text-sm tabular-nums font-medium cursor-pointer ${changeColor}`}
           onClick={onToggle}
         >
-          {change == null ? "-" : `${change > 0 ? "+" : ""}${change}%`}
+          {formattedChange}
         </td>
         <td
           className="px-3 py-2 text-right text-xs tabular-nums text-muted-foreground hidden md:table-cell cursor-pointer"
