@@ -316,5 +316,58 @@ export async function registerRoutes(
 
   app.post("/api/alerts/read-all", (_req, res) => {
     for (const a of alerts) a.read = true;
-    res.json({ message: "All alerts marked as read"
+    res.json({ message: "All alerts marked as read" });
+  });
 
+  app.delete("/api/alerts/:id", (req, res) => {
+    const idx = alerts.findIndex((a) => a.id === req.params.id);
+    if (idx >= 0) alerts.splice(idx, 1);
+    res.json({ message: "Alert deleted" });
+  });
+
+  // ─── Alert Rules ───────────────────────────────────────────────
+
+  app.get("/api/alert-rules", (_req, res) => {
+    res.json(alertRules);
+  });
+
+  app.post("/api/alert-rules", (req, res) => {
+    const rule: AlertRule = {
+      id: randomUUID(),
+      type: req.body.type || "score_above",
+      ticker: req.body.ticker,
+      threshold: req.body.threshold || 70,
+      enabled: true,
+    };
+    alertRules.push(rule);
+
+    if (rule.type === "score_above" && rule.ticker && rule.threshold) {
+      const defaultWeights: FactorWeights = { momentum: 30, quality: 25, lowVol: 20, valuation: 10, erm: 10, insider: 5 };
+      const stock = getAllStocks().find((s) => s.ticker === rule.ticker);
+      if (stock) {
+        const composite = computeComposite(stock, defaultWeights);
+        if (composite >= rule.threshold) {
+          alerts.push({
+            id: randomUUID(),
+            type: "score_above",
+            ticker: rule.ticker,
+            threshold: rule.threshold,
+            message: `${rule.ticker} composite score is ${composite} (threshold: ${rule.threshold})`,
+            createdAt: new Date().toISOString(),
+            read: false,
+          });
+        }
+      }
+    }
+
+    res.json(rule);
+  });
+
+  app.delete("/api/alert-rules/:id", (req, res) => {
+    const idx = alertRules.findIndex((r) => r.id === req.params.id);
+    if (idx >= 0) alertRules.splice(idx, 1);
+    res.json({ message: "Rule deleted" });
+  });
+
+  return httpServer;
+}
