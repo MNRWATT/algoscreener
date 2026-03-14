@@ -27,7 +27,8 @@ function getCompositeColor(score: number): string {
   return "bg-red-500 text-white";
 }
 
-function getChangeColor(change: number): string {
+function getChangeColor(change: number | null): string {
+  if (change == null || Number.isNaN(change)) return "bg-muted text-foreground";
   if (change >= 3) return "bg-emerald-600 text-white";
   if (change >= 1.5) return "bg-emerald-500 text-white";
   if (change >= 0.5) return "bg-emerald-400/80 text-white";
@@ -52,7 +53,10 @@ export default function HeatmapPage() {
   // Compute total market cap for sizing
   const totalMcap = useMemo(() => {
     if (!heatmap) return 1;
-    return heatmap.reduce((sum, s) => sum + s.stocks.reduce((a, c) => a + c.marketCap, 0), 0);
+    return heatmap.reduce(
+      (sum, s) => sum + s.stocks.reduce((a, c) => a + (c.marketCap ?? 0), 0),
+      0
+    );
   }, [heatmap]);
 
   return (
@@ -103,7 +107,10 @@ export default function HeatmapPage() {
         ) : heatmap && heatmap.length > 0 ? (
           <div className="space-y-2">
             {heatmap.map((sector) => {
-              const sectorMcap = sector.stocks.reduce((a, c) => a + c.marketCap, 0);
+              const sectorMcap = sector.stocks.reduce(
+                (a, c) => a + (c.marketCap ?? 0),
+                0
+              );
               return (
                 <div key={sector.sector}>
                   <div className="flex items-center gap-2 mb-1">
@@ -115,10 +122,20 @@ export default function HeatmapPage() {
                   <div className="flex flex-wrap gap-[2px]" data-testid={`heatmap-sector-${sector.sector}`}>
                     {sector.stocks.map((cell) => {
                       // Size cells relative to market cap within sector
-                      const relSize = Math.max(cell.marketCap / sectorMcap * 100, 4);
-                      const colorClass = colorMode === "composite"
-                        ? getCompositeColor(cell.composite)
-                        : getChangeColor(cell.change1d);
+                      const mcap = cell.marketCap ?? 0;
+                      const relSize = sectorMcap > 0
+                        ? Math.max((mcap / sectorMcap) * 100, 4)
+                        : 4;
+                      const colorClass =
+                        colorMode === "composite"
+                          ? getCompositeColor(cell.composite)
+                          : getChangeColor(cell.change1d ?? null);
+
+                      const change = cell.change1d;
+                      const changeText =
+                        change == null || Number.isNaN(change)
+                          ? "-"
+                          : `${change > 0 ? "+" : ""}${change}%`;
 
                       return (
                         <TooltipProvider key={cell.ticker} delayDuration={150}>
@@ -135,9 +152,11 @@ export default function HeatmapPage() {
                                   }}
                                   data-testid={`heatmap-cell-${cell.ticker}`}
                                 >
-                                  <span className="text-[9px] font-bold leading-none truncate max-w-full">{cell.ticker}</span>
+                                  <span className="text-[9px] font-bold leading-none truncate max-w-full">
+                                    {cell.ticker}
+                                  </span>
                                   <span className="text-[8px] tabular-nums font-medium leading-none mt-0.5">
-                                    {colorMode === "composite" ? cell.composite : `${cell.change1d >= 0 ? "+" : ""}${cell.change1d}%`}
+                                    {colorMode === "composite" ? cell.composite : changeText}
                                   </span>
                                 </div>
                               </Link>
@@ -147,11 +166,29 @@ export default function HeatmapPage() {
                                 <p className="text-xs font-semibold">{cell.name}</p>
                                 <p className="text-[10px] text-muted-foreground">{cell.sector}</p>
                                 <div className="grid grid-cols-2 gap-x-3 text-[10px] mt-1">
-                                  <span>Score: <b className="tabular-nums">{cell.composite}</b></span>
-                                  <span>Chg: <b className={`tabular-nums ${cell.change1d >= 0 ? "text-emerald-500" : "text-red-500"}`}>
-                                    {cell.change1d >= 0 ? "+" : ""}{cell.change1d}%
-                                  </b></span>
-                                  <span>MCap: <b className="tabular-nums">${cell.marketCap.toFixed(1)}B</b></span>
+                                  <span>
+                                    Score: <b className="tabular-nums">{cell.composite}</b>
+                                  </span>
+                                  <span>
+                                    Chg: <b
+                                      className={`tabular-nums ${
+                                        change == null || Number.isNaN(change)
+                                          ? "text-muted-foreground"
+                                          : change >= 0
+                                              ? "text-emerald-500"
+                                              : "text-red-500"
+                                      }`}
+                                    >
+                                      {changeText}
+                                    </b>
+                                  </span>
+                                  <span>
+                                    MCap: <b className="tabular-nums">
+                                      {mcap == null || Number.isNaN(mcap)
+                                        ? "-"
+                                        : `$${mcap.toFixed(1)}B`}
+                                    </b>
+                                  </span>
                                 </div>
                               </div>
                             </TooltipContent>
