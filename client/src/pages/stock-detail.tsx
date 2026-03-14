@@ -210,7 +210,7 @@ export default function StockDetailPage() {
           </div>
           <div className="flex items-center gap-4">
             <div className="text-right">
-              <div className="text-xl font-bold tabular-nums">${stock.price.toLocaleString()}</div>
+              <div className="text-xl font-bold tabular-nums">${stock.price != null ? stock.price.toLocaleString() : '—'}</div>
               <div className={`text-sm tabular-nums font-medium ${changeColor}`}>
                 {stock.change1d >= 0 ? "+" : ""}{stock.change1d}%
               </div>
@@ -228,7 +228,7 @@ export default function StockDetailPage() {
         <Card className="p-4">
           <div className="flex items-center justify-between mb-3">
             <span className="text-sm font-semibold">Price History (24M)</span>
-            <span className="text-[10px] text-muted-foreground">MCap: ${stock.marketCap.toFixed(1)}B</span>
+            <span className="text-[10px] text-muted-foreground">MCap: ${stock.marketCap != null ? `${stock.marketCap.toFixed(1)}B` : '—'</span>
           </div>
           <div className="h-[200px]">
             <ResponsiveContainer width="100%" height="100%">
@@ -364,7 +364,7 @@ export default function StockDetailPage() {
           <span className="text-sm font-semibold mb-3 block">Key Financials</span>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             {[
-              { label: "Market Cap", value: `$${stock.marketCap.toFixed(1)}B` },
+              { label: "Market Cap", value: `$${stock.marketCap != null ? `${stock.marketCap.toFixed(1)}B` : '—'` },
               { label: "P/E Ratio", value: m.pe > 0 ? `${m.pe}x` : "N/A" },
               { label: "P/B Ratio", value: `${m.pb}x` },
               { label: "Div Yield", value: `${m.dividendYield}%` },
