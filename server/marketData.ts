@@ -1,4 +1,3 @@
-import yahooFinance from "yahoo-finance2";
 import { getAllStocks } from "./stockData";
 
 export interface LiveQuote {
@@ -10,68 +9,64 @@ export interface LiveQuote {
   name: string | null;
 }
 
+// Node 18+ / Render provide global fetch; declare it so TypeScript is happy.
+declare const fetch: (input: any, init?: any) => Promise<any>;
+
 const cache = new Map<string, { data: LiveQuote; ts: number }>();
 const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
-function mapQuoteToLive(q: any): LiveQuote {
-  return {
-    price: q?.regularMarketPrice ?? null,
-    change: q?.regularMarketChange ?? null,
-    changePercent: q?.regularMarketChangePercent ?? null,
-    volume: q?.regularMarketVolume ?? null,
-    marketCap: q?.marketCap ?? null,
-    name: q?.shortName ?? q?.longName ?? null,
-  };
-}
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
-async function fetchQuote(ticker: string): Promise<LiveQuote | null> {
+async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
+  if (!FINNHUB_API_KEY) {
+    console.warn("[finnhub] FINNHUB_API_KEY not set; skipping live quote");
+    return null;
+  }
+
+  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+    ticker,
+  )}&token=${FINNHUB_API_KEY}`;
+
   try {
-    const q = await yahooFinance.quote(ticker as any);
-    if (!q) return null;
-    return mapQuoteToLive(q);
-  } catch (error: any) {
-    console.warn(
-      `[yahoo-lib] quote failed for ${ticker}: [${error?.name}] ${error?.message}`,
-    );
+    const res = await fetch(url);
+    if (!res || !res.ok) {
+      console.warn(`[finnhub] HTTP ${res?.status} for ${ticker}`);
+      return null;
+    }
+
+    const data = (await res.json()) as any;
+
+    // Finnhub quote response:
+    // c: current price
+    // pc: previous close
+    const c = typeof data.c === "number" ? data.c : null;
+    const pc = typeof data.pc === "number" ? data.pc : null;
+
+    let change: number | null = null;
+    let changePercent: number | null = null;
+    if (c != null && pc != null && pc !== 0) {
+      change = c - pc;
+      changePercent = (change / pc) * 100;
+    }
+
+    return {
+      price: c,
+      change,
+      changePercent,
+      volume: null,
+      marketCap: null,
+      name: null,
+    };
+  } catch (err) {
+    console.warn("[finnhub] fetch failed for", ticker, err);
     return null;
   }
 }
 
 export async function getCachedQuote(ticker: string): Promise<LiveQuote | null> {
-  const cached = cache.get(ticker);
   const now = Date.now();
+  const cached = cache.get(ticker);
   if (cached && now - cached.ts < CACHE_TTL) return cached.data;
 
-  const data = await fetchQuote(ticker);
-  if (data) {
-    cache.set(ticker, { data, ts: now });
-  }
-  return data;
-}
+  const data =
 
-export async function getCachedQuotes(
-  tickers: string[],
-): Promise<Map<string, LiveQuote | null>> {
-  const results = new Map<string, LiveQuote | null>();
-
-  // Simple per-symbol concurrency; yahoo-finance2 already rate-limits internally.
-  for (const t of tickers) {
-    results.set(t, await getCachedQuote(t));
-  }
-
-  return results;
-}
-
-// Pre-warm: fetch all tickers in background after server starts
-export async function prewarmCache(): Promise<void> {
-  const tickers = getAllStocks().map((s) => s.ticker);
-  console.log(`[prewarm] Starting cache warm for ${tickers.length} tickers...`);
-  try {
-    for (const t of tickers) {
-      await getCachedQuote(t);
-    }
-    console.log(`[prewarm] Cache warm complete.`);
-  } catch (err) {
-    console.warn("[prewarm] Cache warm encountered errors (non-fatal):", err);
-  }
-}
