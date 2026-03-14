@@ -39,7 +39,10 @@ export default function WatchlistPage() {
   const { data: screenerData, isLoading: screenerLoading } = useQuery<{ stocks: StockScore[] }>({
     queryKey: ["/api/screener", "momentum=30&quality=25&lowVol=20&valuation=10&erm=10&insider=5"],
     queryFn: async () => {
-      const res = await apiRequest("GET", "/api/screener?momentum=30&quality=25&lowVol=20&valuation=10&erm=10&insider=5");
+      const res = await apiRequest(
+        "GET",
+        "/api/screener?momentum=30&quality=25&lowVol=20&valuation=10&erm=10&insider=5"
+      );
       return res.json();
     },
   });
@@ -66,7 +69,12 @@ export default function WatchlistPage() {
       <header className="sticky top-0 z-50 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
         <div className="max-w-[1200px] mx-auto px-4 h-12 flex items-center gap-3">
           <Link href="/">
-            <Button variant="ghost" size="icon" className="h-8 w-8" data-testid="back-from-watchlist">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              data-testid="back-from-watchlist"
+            >
               <ArrowLeft className="w-4 h-4" />
             </Button>
           </Link>
@@ -74,7 +82,12 @@ export default function WatchlistPage() {
             <Eye className="w-4 h-4 text-primary" />
             <span className="text-sm font-bold">Watchlist</span>
             {watchlist.length > 0 && (
-              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">{watchlist.length}</Badge>
+              <Badge
+                variant="secondary"
+                className="text-[10px] px-1.5 py-0"
+              >
+                {watchlist.length}
+              </Badge>
             )}
           </div>
         </div>
@@ -90,8 +103,12 @@ export default function WatchlistPage() {
         ) : watchedStocks.length === 0 ? (
           <div className="py-16 text-center space-y-3">
             <Star className="w-10 h-10 text-muted-foreground/30 mx-auto" />
-            <p className="text-sm text-muted-foreground">No stocks in your watchlist yet</p>
-            <p className="text-xs text-muted-foreground/70">Click the star icon on any stock to add it</p>
+            <p className="text-sm text-muted-foreground">
+              No stocks in your watchlist yet
+            </p>
+            <p className="text-xs text-muted-foreground/70">
+              Click the star icon on any stock to add it
+            </p>
             <Link href="/">
               <Button variant="outline" size="sm" className="mt-2">
                 <ArrowLeft className="w-3.5 h-3.5 mr-1.5" />
@@ -105,47 +122,108 @@ export default function WatchlistPage() {
               <table className="w-full">
                 <thead>
                   <tr className="border-b border-border bg-muted/40">
-                    <th className="text-left text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">Ticker</th>
-                    <th className="text-right text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">Price</th>
-                    <th className="text-right text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">Chg%</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">Mom</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">Qua</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">LVo</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">Val</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">ERM</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">Ins</th>
-                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">Score</th>
+                    <th className="text-left text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">
+                      Ticker
+                    </th>
+                    <th className="text-right text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">
+                      Price
+                    </th>
+                    <th className="text-right text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">
+                      Chg%
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">
+                      Mom
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">
+                      Qua
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">
+                      LVo
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">
+                      Val
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">
+                      ERM
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-2 py-2.5 hidden sm:table-cell">
+                      Ins
+                    </th>
+                    <th className="text-center text-[10px] font-semibold uppercase tracking-wider px-3 py-2.5">
+                      Score
+                    </th>
                     <th className="w-8 px-2" />
                   </tr>
                 </thead>
                 <tbody>
                   {watchedStocks.map((stock) => {
-                    const changeColor = stock.change1d >= 0
-                      ? "text-emerald-600 dark:text-emerald-400"
-                      : "text-red-600 dark:text-red-400";
+                    const change = stock.change1d;
+                    const changeColor =
+                      change == null || Number.isNaN(change)
+                        ? "text-muted-foreground"
+                        : change >= 0
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : "text-red-600 dark:text-red-400";
+
                     const compositeColor =
-                      stock.composite >= 70 ? "text-emerald-600 dark:text-emerald-400" :
-                      stock.composite >= 50 ? "text-foreground" :
-                      "text-muted-foreground";
+                      stock.composite >= 70
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : stock.composite >= 50
+                          ? "text-foreground"
+                          : "text-muted-foreground";
+
+                    const price = stock.price;
+                    const priceText =
+                      price == null || Number.isNaN(price)
+                        ? "-"
+                        : `$${price.toLocaleString()}`;
+                    const changeText =
+                      change == null || Number.isNaN(change)
+                        ? "-"
+                        : `${change > 0 ? "+" : ""}${change}%`;
 
                     return (
-                      <tr key={stock.ticker} className="border-b border-border/50 hover:bg-muted/30 transition-colors" data-testid={`watchlist-row-${stock.ticker}`}>
+                      <tr
+                        key={stock.ticker}
+                        className="border-b border-border/50 hover:bg-muted/30 transition-colors"
+                        data-testid={`watchlist-row-${stock.ticker}`}
+                      >
                         <td className="px-3 py-2.5">
                           <Link href={`/stock/${stock.ticker}`}>
                             <div className="cursor-pointer">
-                              <span className="text-sm font-semibold tabular-nums text-primary hover:underline">{stock.ticker}</span>
-                              <span className="text-[10px] text-muted-foreground block truncate max-w-[160px]">{stock.name}</span>
+                              <span className="text-sm font-semibold tabular-nums text-primary hover:underline">
+                                {stock.ticker}
+                              </span>
+                              <span className="text-[10px] text-muted-foreground block truncate max-w-[160px]">
+                                {stock.name}
+                              </span>
                             </div>
                           </Link>
                         </td>
-                        <td className="px-3 py-2.5 text-right text-sm tabular-nums font-medium">${stock.price.toLocaleString()}</td>
-                        <td className={`px-3 py-2.5 text-right text-sm tabular-nums font-medium ${changeColor}`}>
-                          {stock.change1d >= 0 ? "+" : ""}{stock.change1d}%
+                        <td className="px-3 py-2.5 text-right text-sm tabular-nums font-medium">
+                          {priceText}
                         </td>
-                        {(["momentum", "quality", "lowVol", "valuation", "erm", "insider"] as const).map((f) => (
-                          <td key={f} className="px-2 py-2.5 hidden sm:table-cell">
+                        <td
+                          className={`px-3 py-2.5 text-right text-sm tabular-nums font-medium ${changeColor}`}
+                        >
+                          {changeText}
+                        </td>
+                        {([
+                          "momentum",
+                          "quality",
+                          "lowVol",
+                          "valuation",
+                          "erm",
+                          "insider",
+                        ] as const).map((f) => (
+                          <td
+                            key={f}
+                            className="px-2 py-2.5 hidden sm:table-cell"
+                          >
                             <div className="flex flex-col items-center gap-0.5">
-                              <span className="text-[10px] tabular-nums font-medium">{stock[f]}</span>
+                              <span className="text-[10px] tabular-nums font-medium">
+                                {stock[f]}
+                              </span>
                               <div className="w-10">
                                 <ScoreBar score={stock[f]} />
                               </div>
@@ -153,7 +231,9 @@ export default function WatchlistPage() {
                           </td>
                         ))}
                         <td className="px-3 py-2.5 text-center">
-                          <span className={`text-sm tabular-nums font-bold ${compositeColor}`}>
+                          <span
+                            className={`text-sm tabular-nums font-bold ${compositeColor}`}
+                          >
                             {stock.composite}
                           </span>
                         </td>
