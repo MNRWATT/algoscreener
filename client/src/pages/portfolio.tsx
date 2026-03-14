@@ -161,8 +161,8 @@ export default function PortfolioPage() {
 
   const sortedHoldings = portfolio?.holdings
     ? [...portfolio.holdings].sort((a, b) => {
-        const aVal = a[sortField];
-        const bVal = b[sortField];
+        const aVal = (a[sortField] ?? 0) as number;
+        const bVal = (b[sortField] ?? 0) as number;
         return sortAsc ? aVal - bVal : bVal - aVal;
       })
     : [];
@@ -456,46 +456,56 @@ export default function PortfolioPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {displayedHoldings.map((h, idx) => (
-                      <tr
-                        key={h.ticker}
-                        className="border-b border-border/50 hover:bg-muted/30 transition-colors"
-                        data-testid={`portfolio-holding-${h.ticker}`}
-                      >
-                        <td className="text-[11px] text-muted-foreground tabular-nums py-2 px-2">{idx + 1}</td>
-                        <td className="py-2 px-2">
-                          <Link href={`/stock/${h.ticker}`}>
-                            <div className="cursor-pointer hover:underline">
-                              <div className="text-xs font-semibold">{h.ticker}</div>
-                              <div className="text-[10px] text-muted-foreground truncate max-w-[140px]">{h.name}</div>
+                    {displayedHoldings.map((h, idx) => {
+                      const change = h.change1d;
+                      const changeColor =
+                        change == null
+                          ? "text-muted-foreground"
+                          : change >= 0
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : "text-red-600 dark:text-red-400";
+
+                      return (
+                        <tr
+                          key={h.ticker}
+                          className="border-b border-border/50 hover:bg-muted/30 transition-colors"
+                          data-testid={`portfolio-holding-${h.ticker}`}
+                        >
+                          <td className="text-[11px] text-muted-foreground tabular-nums py-2 px-2">{idx + 1}</td>
+                          <td className="py-2 px-2">
+                            <Link href={`/stock/${h.ticker}`}>
+                              <div className="cursor-pointer hover:underline">
+                                <div className="text-xs font-semibold">{h.ticker}</div>
+                                <div className="text-[10px] text-muted-foreground truncate max-w-[140px]">{h.name}</div>
+                              </div>
+                            </Link>
+                          </td>
+                          <td className="text-[11px] text-muted-foreground py-2 px-2 hidden sm:table-cell">
+                            <Badge variant="secondary" className="text-[9px] px-1 py-0 font-normal">{h.sector}</Badge>
+                          </td>
+                          <td className="text-right py-2 px-2">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <div className="w-16 h-1.5 bg-muted rounded-full overflow-hidden hidden sm:block">
+                                <div
+                                  className="h-full bg-primary/60 rounded-full"
+                                  style={{ width: `${Math.min(h.weight * 2.5, 100)}%` }}
+                                />
+                              </div>
+                              <span className="text-xs font-semibold tabular-nums">{h.weight}%</span>
                             </div>
-                          </Link>
-                        </td>
-                        <td className="text-[11px] text-muted-foreground py-2 px-2 hidden sm:table-cell">
-                          <Badge variant="secondary" className="text-[9px] px-1 py-0 font-normal">{h.sector}</Badge>
-                        </td>
-                        <td className="text-right py-2 px-2">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <div className="w-16 h-1.5 bg-muted rounded-full overflow-hidden hidden sm:block">
-                              <div
-                                className="h-full bg-primary/60 rounded-full"
-                                style={{ width: `${Math.min(h.weight * 2.5, 100)}%` }}
-                              />
-                            </div>
-                            <span className="text-xs font-semibold tabular-nums">{h.weight}%</span>
-                          </div>
-                        </td>
-                        <td className="text-[11px] text-right tabular-nums py-2 px-2 hidden sm:table-cell text-muted-foreground">{h.shares.toFixed(2)}</td>
-                        <td className="text-[11px] text-right tabular-nums py-2 px-2 hidden sm:table-cell">${h.marketValue.toLocaleString()}</td>
-                        <td className="text-xs text-right tabular-nums py-2 px-2">${h.price.toFixed(2)}</td>
-                        <td className={`text-xs text-right tabular-nums font-medium py-2 px-2 ${
-                          h.change1d >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"
-                        }`}>
-                          {h.change1d > 0 ? "+" : ""}{h.change1d}%
-                        </td>
-                        <td className="text-xs text-right tabular-nums font-medium py-2 px-2">{h.compositeScore}</td>
-                      </tr>
-                    ))}
+                          </td>
+                          <td className="text-[11px] text-right tabular-nums py-2 px-2 hidden sm:table-cell text-muted-foreground">{h.shares.toFixed(2)}</td>
+                          <td className="text-[11px] text-right tabular-nums py-2 px-2 hidden sm:table-cell">${h.marketValue.toLocaleString()}</td>
+                          <td className="text-xs text-right tabular-nums py-2 px-2">
+                            {h.price == null ? "-" : `$${h.price.toFixed(2)}`}
+                          </td>
+                          <td className={`text-xs text-right tabular-nums font-medium py-2 px-2 ${changeColor}`}>
+                            {change == null ? "-" : `${change > 0 ? "+" : ""}${change}%`}
+                          </td>
+                          <td className="text-xs text-right tabular-nums font-medium py-2 px-2">{h.compositeScore}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
