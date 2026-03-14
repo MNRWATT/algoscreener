@@ -5,8 +5,9 @@ import { getCachedQuote, getCachedQuotes } from "./marketData";
 import type { MarketRegime, PresetStrategy, WatchlistItem, Alert, AlertRule, FactorWeights } from "@shared/schema";
 import { randomUUID } from "crypto";
 
-function live(value: number | null | undefined): number | string {
-  return value !== null && value !== undefined ? value : "-";
+// Returns the live value if available, or null (never a string)
+function live<T>(value: T | null | undefined): T | null {
+  return value !== null && value !== undefined ? value : null;
 }
 
 const PRESETS: PresetStrategy[] = [
@@ -59,7 +60,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const liveQuotes = await getCachedQuotes(stocks.map((s) => s.ticker));
       const enriched = stocks.map((s) => {
         const q = liveQuotes.get(s.ticker) ?? null;
-        return { ...s, price: live(q?.price), change1d: live(q?.changePercent), marketCap: live(q?.marketCap != null ? q.marketCap / 1e9 : null) };
+        return {
+          ...s,
+          price: live(q?.price),
+          change1d: live(q?.changePercent),
+          marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
+          name: q?.name ?? s.name,
+        };
       });
       res.json({ stocks: enriched, lastUpdated: new Date().toISOString(), universe: "TSX + S&P 500 + NASDAQ 100 + DOW 30" });
     } catch (err) { console.error("[screener] error:", err); res.status(500).json({ error: "Failed to load screener data" }); }
@@ -77,7 +84,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const detail = getStockDetail(ticker, weights);
       if (!detail) { res.status(404).json({ error: "Stock not found" }); return; }
       const q = await getCachedQuote(ticker);
-      res.json({ ...detail, price: live(q?.price), change1d: live(q?.changePercent), marketCap: live(q?.marketCap != null ? q.marketCap / 1e9 : null), name: q?.name ?? detail.name });
+      res.json({
+        ...detail,
+        price: live(q?.price),
+        change1d: live(q?.changePercent),
+        marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
+        name: q?.name ?? detail.name,
+      });
     } catch (err) { console.error("[stock detail] error:", err); res.status(500).json({ error: "Failed to load stock detail" }); }
   });
 
@@ -85,8 +98,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const { ticker } = req.params;
       const q = await getCachedQuote(ticker);
-      if (!q) { res.json({ ticker, price: "-", change: "-", changePercent: "-", volume: "-", marketCap: "-", name: "-" }); return; }
-      res.json({ ticker, price: live(q.price), change: live(q.change), changePercent: live(q.changePercent), volume: live(q.volume), marketCap: live(q.marketCap), name: q.name ?? "-" });
+      res.json({
+        ticker,
+        price: live(q?.price),
+        change: live(q?.change),
+        changePercent: live(q?.changePercent),
+        volume: live(q?.volume),
+        marketCap: live(q?.marketCap),
+        name: q?.name ?? null,
+      });
     } catch (err) { console.error("[quote] error:", err); res.status(500).json({ error: "Failed to fetch quote" }); }
   });
 
@@ -104,7 +124,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const liveQuotes = await getCachedQuotes(portfolio.holdings.map((h) => h.ticker));
       const enrichedHoldings = portfolio.holdings.map((h) => {
         const q = liveQuotes.get(h.ticker) ?? null;
-        return { ...h, price: live(q?.price), change1d: live(q?.changePercent) };
+        return {
+          ...h,
+          price: live(q?.price),
+          change1d: live(q?.changePercent),
+        };
       });
       res.json({ ...portfolio, holdings: enrichedHoldings });
     } catch (err) { console.error("[portfolio] error:", err); res.status(500).json({ error: "Failed to load portfolio data" }); }
@@ -120,7 +144,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         ...sector,
         stocks: sector.stocks.map((s) => {
           const q = liveQuotes.get(s.ticker) ?? null;
-          return { ...s, change1d: live(q?.changePercent), price: live(q?.price), marketCap: live(q?.marketCap != null ? q.marketCap / 1e9 : null) };
+          return {
+            ...s,
+            change1d: live(q?.changePercent),
+            price: live(q?.price),
+            marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
+          };
         }),
       }));
       res.json(enriched);
