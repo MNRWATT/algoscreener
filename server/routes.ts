@@ -68,7 +68,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           name: q?.name ?? s.name,
         };
       });
-      res.json({ stocks: enriched, lastUpdated: new Date().toISOString(), universe: "TSX + S&P 500 + NASDAQ 100 + DOW 30" });
+      res.json({ stocks: enriched, lastUpdated: new Date().toISOString(), universe: "S&P 500 + NASDAQ 100 + DOW 30 (US only)" });
     } catch (err) { console.error("[screener] error:", err); res.status(500).json({ error: "Failed to load screener data" }); }
   });
 
