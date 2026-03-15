@@ -3,6 +3,7 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
 import { prewarmCache } from "./marketData";
+import { initFundamentalsCache } from "./fundamentalsCache";
 
 const app = express();
 const httpServer = createServer(app);
@@ -81,8 +82,12 @@ app.use((req, res, next) => {
     { port, host: "0.0.0.0", reusePort: true },
     () => {
       log(`serving on port ${port}`);
-      // Fire-and-forget: warm the Yahoo Finance cache in background after startup
-      prewarmCache().catch((err) => console.warn("[prewarm] failed:", err));
+
+      // Fire-and-forget: init FMP fundamentals cache first (real factor scores)
+      // then warm Finnhub price cache for top tickers
+      initFundamentalsCache()
+        .then(() => prewarmCache())
+        .catch((err) => console.warn("[startup] cache init failed (non-fatal):", err));
     },
   );
 })();
