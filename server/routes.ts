@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { getScreenedStocks, SECTORS, EXCHANGES, getStockDetail, runBacktest, getSectorHeatmap, getAllStocks, computeComposite, buildPortfolio } from "./stockData";
-import { getCachedQuote, getCachedQuotes } from "./marketData";
+import { getCachedQuote, getCachedQuotes, isTradableQuote } from "./marketData";
 import { getCacheStatus } from "./fundamentalsCache";
 import type { MarketRegime, PresetStrategy, WatchlistItem, Alert, AlertRule, FactorWeights } from "@shared/schema";
 import { randomUUID } from "crypto";
@@ -60,24 +60,38 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // getScreenedStocks already slices to top 50 after scoring all ~250 stocks
       const stocks = getScreenedStocks(weights);
       const liveQuotes = await getCachedQuotes(stocks.map((s) => s.ticker));
-      const enriched = stocks.map((s) => {
-        const q = liveQuotes.get(s.ticker) ?? null;
-        return {
-          ...s,
-          price: live(q?.price),
-          change1d: live(q?.changePercent),
-          marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
-          name: q?.name ?? s.name,
-        };
-      });
+      const enriched = stocks
+        .map((s) => {
+          const q = liveQuotes.get(s.ticker) ?? null;
+          const price = live(q?.price);
+          return {
+            ...s,
+            price,
+            change1d: live(q?.changePercent),
+            marketCap:
+              q?.marketCap != null
+                ? Math.round((q.marketCap / 1e9) * 10) / 10
+                : null,
+            name: q?.name ?? s.name,
+            _hasLiveQuote: isTradableQuote(q),
+          };
+        })
+        .filter((row) => row._hasLiveQuote)
+        .map(({ _hasLiveQuote, ...rest }) => rest);
       const cacheInfo = getCacheStatus();
       res.json({
         stocks: enriched,
         lastUpdated: new Date().toISOString(),
         universe: `S&P 500 + NASDAQ 100 (US only, top 50 of ${getAllStocks().length})`,
-        fundamentalsSource: cacheInfo.fmpEnabled && cacheInfo.status === "ready" ? "FMP real data" : "seeded model",
+        fundamentalsSource:
+          cacheInfo.fmpEnabled && cacheInfo.status === "ready"
+            ? "FMP real data"
+            : "seeded model",
       });
-    } catch (err) { console.error("[screener] error:", err); res.status(500).json({ error: "Failed to load screener data" }); }
+    } catch (err) {
+      console.error("[screener] error:", err);
+      res.status(500).json({ error: "Failed to load screener data" });
+    }
   });
 
   app.get("/api/sectors", (_req, res) => res.json(SECTORS));
@@ -93,16 +107,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const { ticker } = req.params;
       const weights = parseWeights(req.query as Record<string, unknown>);
       const detail = getStockDetail(ticker, weights);
-      if (!detail) { res.status(404).json({ error: "Stock not found" }); return; }
+      if (!detail) {
+        res.status(404).json({ error: "Stock not found" });
+        return;
+      }
       const q = await getCachedQuote(ticker);
       res.json({
         ...detail,
         price: live(q?.price),
         change1d: live(q?.changePercent),
-        marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
+        marketCap:
+          q?.marketCap != null
+            ? Math.round((q.marketCap / 1e9) * 10) / 10
+            : null,
         name: q?.name ?? detail.name,
       });
-    } catch (err) { console.error("[stock detail] error:", err); res.status(500).json({ error: "Failed to load stock detail" }); }
+    } catch (err) {
+      console.error("[stock detail] error:", err);
+      res.status(500).json({ error: "Failed to load stock detail" });
+    }
   });
 
   app.get("/api/quote/:ticker", async (req, res) => {
@@ -118,13 +141,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         marketCap: live(q?.marketCap),
         name: q?.name ?? null,
       });
-    } catch (err) { console.error("[quote] error:", err); res.status(500).json({ error: "Failed to fetch quote" }); }
+    } catch (err) {
+      console.error("[quote] error:", err);
+      res.status(500).json({ error: "Failed to fetch quote" });
+    }
   });
 
   app.get("/api/backtest", (req, res) => {
     const weights = parseWeights(req.query as Record<string, unknown>);
     const period = (req.query.period as string) || "1y";
-    if (!["1y", "3y", "5y"].includes(period)) { res.status(400).json({ error: "Invalid period. Use 1y, 3y, or 5y" }); return; }
+    if (!["1y", "3y", "5y"].includes(period)) {
+      res.status(400).json({ error: "Invalid period. Use 1y, 3y, or 5y" });
+      return;
+    }
     res.json(runBacktest(weights, period as "1y" | "3y" | "5y"));
   });
 
@@ -132,61 +161,147 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const weights = parseWeights(req.query as Record<string, unknown>);
       const portfolio = buildPortfolio(weights);
-      const liveQuotes = await getCachedQuotes(portfolio.holdings.map((h) => h.ticker));
-      const enrichedHoldings = portfolio.holdings.map((h) => {
-        const q = liveQuotes.get(h.ticker) ?? null;
-        return { ...h, price: live(q?.price), change1d: live(q?.changePercent) };
-      });
+      const liveQuotes = await getCachedQuotes(
+        portfolio.holdings.map((h) => h.ticker),
+      );
+      const enrichedHoldings = portfolio.holdings
+        .map((h) => {
+          const q = liveQuotes.get(h.ticker) ?? null;
+          return {
+            ...h,
+            price: live(q?.price),
+            change1d: live(q?.changePercent),
+            _hasLiveQuote: isTradableQuote(q),
+          };
+        })
+        .filter((h) => h._hasLiveQuote)
+        .map(({ _hasLiveQuote, ...rest }) => rest);
       res.json({ ...portfolio, holdings: enrichedHoldings });
-    } catch (err) { console.error("[portfolio] error:", err); res.status(500).json({ error: "Failed to load portfolio data" }); }
+    } catch (err) {
+      console.error("[portfolio] error:", err);
+      res.status(500).json({ error: "Failed to load portfolio data" });
+    }
   });
 
   app.get("/api/heatmap", async (req, res) => {
     try {
       const weights = parseWeights(req.query as Record<string, unknown>);
       const heatmap = getSectorHeatmap(weights);
-      const allTickers = heatmap.flatMap((sector) => sector.stocks.map((s) => s.ticker));
+      const allTickers = heatmap.flatMap((sector) =>
+        sector.stocks.map((s) => s.ticker),
+      );
       const liveQuotes = await getCachedQuotes(allTickers);
       const enriched = heatmap.map((sector) => ({
         ...sector,
-        stocks: sector.stocks.map((s) => {
-          const q = liveQuotes.get(s.ticker) ?? null;
-          return { ...s, change1d: live(q?.changePercent), price: live(q?.price), marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null };
-        }),
+        stocks: sector.stocks
+          .map((s) => {
+            const q = liveQuotes.get(s.ticker) ?? null;
+            return {
+              ...s,
+              change1d: live(q?.changePercent),
+              price: live(q?.price),
+              marketCap:
+                q?.marketCap != null
+                  ? Math.round((q.marketCap / 1e9) * 10) / 10
+                  : null,
+              _hasLiveQuote: isTradableQuote(q),
+            };
+          })
+          .filter((s) => s._hasLiveQuote)
+          .map(({ _hasLiveQuote, ...rest }) => rest),
       }));
       res.json(enriched);
-    } catch (err) { console.error("[heatmap] error:", err); res.status(500).json({ error: "Failed to load heatmap data" }); }
+    } catch (err) {
+      console.error("[heatmap] error:", err);
+      res.status(500).json({ error: "Failed to load heatmap data" });
+    }
   });
 
-  app.get("/api/watchlist", (_req, res) => res.json(Array.from(watchlist.values())));
+  app.get("/api/watchlist", (_req, res) =>
+    res.json(Array.from(watchlist.values())),
+  );
   app.post("/api/watchlist/:ticker", (req, res) => {
     const { ticker } = req.params;
     const stock = getAllStocks().find((s) => s.ticker === ticker);
-    if (!stock) { res.status(404).json({ error: "Stock not found" }); return; }
-    if (watchlist.has(ticker)) { res.json({ message: "Already in watchlist" }); return; }
+    if (!stock) {
+      res.status(404).json({ error: "Stock not found" });
+      return;
+    }
+    if (watchlist.has(ticker)) {
+      res.json({ message: "Already in watchlist" });
+      return;
+    }
     watchlist.set(ticker, { ticker, addedAt: new Date().toISOString() });
     res.json({ message: "Added to watchlist", item: watchlist.get(ticker) });
   });
-  app.delete("/api/watchlist/:ticker", (req, res) => { watchlist.delete(req.params.ticker); res.json({ message: "Removed from watchlist" }); });
+  app.delete("/api/watchlist/:ticker", (req, res) => {
+    watchlist.delete(req.params.ticker);
+    res.json({ message: "Removed from watchlist" });
+  });
 
-  app.get("/api/alerts", (_req, res) => res.json(alerts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())));
-  app.post("/api/alerts/read/:id", (req, res) => { const a = alerts.find((a) => a.id === req.params.id); if (a) a.read = true; res.json({ message: "Alert marked as read" }); });
-  app.post("/api/alerts/read-all", (_req, res) => { for (const a of alerts) a.read = true; res.json({ message: "All alerts marked as read" }); });
-  app.delete("/api/alerts/:id", (req, res) => { const idx = alerts.findIndex((a) => a.id === req.params.id); if (idx >= 0) alerts.splice(idx, 1); res.json({ message: "Alert deleted" }); });
+  app.get("/api/alerts", (_req, res) =>
+    res.json(
+      alerts.sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() -
+          new Date(a.createdAt).getTime(),
+      ),
+    ),
+  );
+  app.post("/api/alerts/read/:id", (req, res) => {
+    const a = alerts.find((a) => a.id === req.params.id);
+    if (a) a.read = true;
+    res.json({ message: "Alert marked as read" });
+  });
+  app.post("/api/alerts/read-all", (_req, res) => {
+    for (const a of alerts) a.read = true;
+    res.json({ message: "All alerts marked as read" });
+  });
+  app.delete("/api/alerts/:id", (req, res) => {
+    const idx = alerts.findIndex((a) => a.id === req.params.id);
+    if (idx >= 0) alerts.splice(idx, 1);
+    res.json({ message: "Alert deleted" });
+  });
   app.get("/api/alert-rules", (_req, res) => res.json(alertRules));
   app.post("/api/alert-rules", (req, res) => {
-    const rule: AlertRule = { id: randomUUID(), type: req.body.type || "score_above", ticker: req.body.ticker, threshold: req.body.threshold || 70, enabled: true };
+    const rule: AlertRule = {
+      id: randomUUID(),
+      type: req.body.type || "score_above",
+      ticker: req.body.ticker,
+      threshold: req.body.threshold || 70,
+      enabled: true,
+    };
     alertRules.push(rule);
     if (rule.type === "score_above" && rule.ticker && rule.threshold) {
       const stock = getAllStocks().find((s) => s.ticker === rule.ticker);
       if (stock) {
-        const composite = computeComposite(stock, { momentum: 30, quality: 25, lowVol: 20, valuation: 10, erm: 10, insider: 5 });
-        if (composite >= rule.threshold) alerts.push({ id: randomUUID(), type: "score_above", ticker: rule.ticker, threshold: rule.threshold, message: `${rule.ticker} composite score is ${composite} (threshold: ${rule.threshold})`, createdAt: new Date().toISOString(), read: false });
+        const composite = computeComposite(stock, {
+          momentum: 30,
+          quality: 25,
+          lowVol: 20,
+          valuation: 10,
+          erm: 10,
+          insider: 5,
+        });
+        if (composite >= rule.threshold)
+          alerts.push({
+            id: randomUUID(),
+            type: "score_above",
+            ticker: rule.ticker,
+            threshold: rule.threshold,
+            message: `${rule.ticker} composite score is ${composite} (threshold: ${rule.threshold})`,
+            createdAt: new Date().toISOString(),
+            read: false,
+          });
       }
     }
     res.json(rule);
   });
-  app.delete("/api/alert-rules/:id", (req, res) => { const idx = alertRules.findIndex((r) => r.id === req.params.id); if (idx >= 0) alertRules.splice(idx, 1); res.json({ message: "Rule deleted" }); });
+  app.delete("/api/alert-rules/:id", (req, res) => {
+    const idx = alertRules.findIndex((r) => r.id === req.params.id);
+    if (idx >= 0) alertRules.splice(idx, 1);
+    res.json({ message: "Rule deleted" });
+  });
 
   return httpServer;
 }
