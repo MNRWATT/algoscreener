@@ -2,10 +2,10 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { getScreenedStocks, SECTORS, EXCHANGES, getStockDetail, runBacktest, getSectorHeatmap, getAllStocks, computeComposite, buildPortfolio } from "./stockData";
 import { getCachedQuote, getCachedQuotes } from "./marketData";
+import { getCacheStatus } from "./fundamentalsCache";
 import type { MarketRegime, PresetStrategy, WatchlistItem, Alert, AlertRule, FactorWeights } from "@shared/schema";
 import { randomUUID } from "crypto";
 
-// Returns the live value if available, or null (never a string)
 function live<T>(value: T | null | undefined): T | null {
   return value !== null && value !== undefined ? value : null;
 }
@@ -53,9 +53,11 @@ function parseWeights(query: Record<string, unknown>): FactorWeights {
 
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
 
+  // Screener: scores full universe, returns top 50 ranked by composite
   app.get("/api/screener", async (req, res) => {
     try {
       const weights = parseWeights(req.query as Record<string, unknown>);
+      // getScreenedStocks already slices to top 50 after scoring all ~250 stocks
       const stocks = getScreenedStocks(weights);
       const liveQuotes = await getCachedQuotes(stocks.map((s) => s.ticker));
       const enriched = stocks.map((s) => {
@@ -68,7 +70,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           name: q?.name ?? s.name,
         };
       });
-      res.json({ stocks: enriched, lastUpdated: new Date().toISOString(), universe: "S&P 500 + NASDAQ 100 + DOW 30 (US only)" });
+      const cacheInfo = getCacheStatus();
+      res.json({
+        stocks: enriched,
+        lastUpdated: new Date().toISOString(),
+        universe: `S&P 500 + NASDAQ 100 (US only, top 50 of ${getAllStocks().length})`,
+        fundamentalsSource: cacheInfo.fmpEnabled && cacheInfo.status === "ready" ? "FMP real data" : "seeded model",
+      });
     } catch (err) { console.error("[screener] error:", err); res.status(500).json({ error: "Failed to load screener data" }); }
   });
 
@@ -76,6 +84,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/exchanges", (_req, res) => res.json(EXCHANGES));
   app.get("/api/market-regime", (_req, res) => res.json(getMarketRegime()));
   app.get("/api/presets", (_req, res) => res.json(PRESETS));
+
+  // Expose cache status so the UI can show a "Live Data" vs "Model" badge
+  app.get("/api/cache-status", (_req, res) => res.json(getCacheStatus()));
 
   app.get("/api/stock/:ticker", async (req, res) => {
     try {
@@ -124,11 +135,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const liveQuotes = await getCachedQuotes(portfolio.holdings.map((h) => h.ticker));
       const enrichedHoldings = portfolio.holdings.map((h) => {
         const q = liveQuotes.get(h.ticker) ?? null;
-        return {
-          ...h,
-          price: live(q?.price),
-          change1d: live(q?.changePercent),
-        };
+        return { ...h, price: live(q?.price), change1d: live(q?.changePercent) };
       });
       res.json({ ...portfolio, holdings: enrichedHoldings });
     } catch (err) { console.error("[portfolio] error:", err); res.status(500).json({ error: "Failed to load portfolio data" }); }
@@ -144,12 +151,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         ...sector,
         stocks: sector.stocks.map((s) => {
           const q = liveQuotes.get(s.ticker) ?? null;
-          return {
-            ...s,
-            change1d: live(q?.changePercent),
-            price: live(q?.price),
-            marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
-          };
+          return { ...s, change1d: live(q?.changePercent), price: live(q?.price), marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null };
         }),
       }));
       res.json(enriched);
@@ -157,7 +159,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   });
 
   app.get("/api/watchlist", (_req, res) => res.json(Array.from(watchlist.values())));
-
   app.post("/api/watchlist/:ticker", (req, res) => {
     const { ticker } = req.params;
     const stock = getAllStocks().find((s) => s.ticker === ticker);
@@ -166,16 +167,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     watchlist.set(ticker, { ticker, addedAt: new Date().toISOString() });
     res.json({ message: "Added to watchlist", item: watchlist.get(ticker) });
   });
-
   app.delete("/api/watchlist/:ticker", (req, res) => { watchlist.delete(req.params.ticker); res.json({ message: "Removed from watchlist" }); });
 
   app.get("/api/alerts", (_req, res) => res.json(alerts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())));
   app.post("/api/alerts/read/:id", (req, res) => { const a = alerts.find((a) => a.id === req.params.id); if (a) a.read = true; res.json({ message: "Alert marked as read" }); });
   app.post("/api/alerts/read-all", (_req, res) => { for (const a of alerts) a.read = true; res.json({ message: "All alerts marked as read" }); });
   app.delete("/api/alerts/:id", (req, res) => { const idx = alerts.findIndex((a) => a.id === req.params.id); if (idx >= 0) alerts.splice(idx, 1); res.json({ message: "Alert deleted" }); });
-
   app.get("/api/alert-rules", (_req, res) => res.json(alertRules));
-
   app.post("/api/alert-rules", (req, res) => {
     const rule: AlertRule = { id: randomUUID(), type: req.body.type || "score_above", ticker: req.body.ticker, threshold: req.body.threshold || 70, enabled: true };
     alertRules.push(rule);
@@ -188,7 +186,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
     res.json(rule);
   });
-
   app.delete("/api/alert-rules/:id", (req, res) => { const idx = alertRules.findIndex((r) => r.id === req.params.id); if (idx >= 0) alertRules.splice(idx, 1); res.json({ message: "Rule deleted" }); });
 
   return httpServer;
