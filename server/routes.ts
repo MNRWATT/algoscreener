@@ -1,9 +1,9 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { getScreenedStocks, SECTORS, EXCHANGES, getStockDetail, runBacktest, getSectorHeatmap, getAllStocks, computeComposite, buildPortfolio } from "./stockData";
-import { getCachedQuote, getCachedQuotes, isTradableQuote } from "./marketData";
+import { getCachedQuote, getCachedQuotes, isTradableQuote, getPriceHistory24M, computeReturnsFromHistory } from "./marketData";
 import { getCacheStatus } from "./fundamentalsCache";
-import type { MarketRegime, PresetStrategy, WatchlistItem, Alert, AlertRule, FactorWeights } from "@shared/schema";
+import type { MarketRegime, PresetStrategy, WatchlistItem, Alert, AlertRule, FactorWeights, StockScore } from "@shared/schema";
 import { randomUUID } from "crypto";
 
 function live<T>(value: T | null | undefined): T | null {
@@ -111,7 +111,49 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         res.status(404).json({ error: "Stock not found" });
         return;
       }
+
+      // Overlay live quote
       const q = await getCachedQuote(ticker);
+
+      // Overlay real 24M price history + momentum returns when available
+      const history = await getPriceHistory24M(ticker);
+      let priceHistory = detail.priceHistory;
+      let metrics = detail.metrics;
+      let momentum = detail.momentum;
+      let composite = detail.composite;
+
+      if (history && history.length > 0) {
+        priceHistory = history;
+        const returns = computeReturnsFromHistory(history);
+        metrics = {
+          ...metrics,
+          return12m: returns.return12m ?? metrics.return12m,
+          return6m: returns.return6m ?? metrics.return6m,
+          return3m: returns.return3m ?? metrics.return3m,
+        };
+        if (
+          returns.return12m !== null ||
+          returns.return6m !== null ||
+          returns.return3m !== null
+        ) {
+          const r12 = returns.return12m ?? 0;
+          const r6 = returns.return6m ?? 0;
+          const r3 = returns.return3m ?? 0;
+          const momRaw = r12 * 0.5 + r6 * 0.3 + r3 * 0.2;
+          const newMomentum = Math.max(
+            0,
+            Math.min(100, Math.round(50 + momRaw * 1.2)),
+          );
+          momentum = newMomentum;
+          const updated: StockScore = {
+            ...detail,
+            momentum,
+            metrics,
+          };
+          composite = computeComposite(updated, weights);
+        }
+      }
+
       res.json({
         ...detail,
         price: live(q?.price),
@@ -121,6 +163,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             ? Math.round((q.marketCap / 1e9) * 10) / 10
             : null,
         name: q?.name ?? detail.name,
+        priceHistory,
+        metrics,
+        momentum,
+        composite,
       });
     } catch (err) {
       console.error("[stock detail] error:", err);
