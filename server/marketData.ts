@@ -1,5 +1,6 @@
 import { getAllStocks } from "./stockData";
 import { getFundamentals } from "./fundamentalsCache";
+import type { PricePoint } from "@shared/schema";
 
 export interface LiveQuote {
   price: number | null;
@@ -20,8 +21,12 @@ export function isTradableQuote(q: LiveQuote | null): boolean {
 
 declare const fetch: (input: any, init?: any) => Promise<any>;
 
-const cache = new Map<string, { data: LiveQuote; ts: number }>();
-const CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+const quoteCache = new Map<string, { data: LiveQuote; ts: number }>();
+const QUOTE_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+// Daily price history (24M) cache
+const historyCache = new Map<string, { data: PricePoint[]; ts: number }>();
+const HISTORY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 
@@ -31,7 +36,9 @@ async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
     return null;
   }
 
-  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_API_KEY}`;
+  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+    ticker,
+  )}&token=${FINNHUB_API_KEY}`;
 
   try {
     const res = await fetch(url);
@@ -74,12 +81,12 @@ async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
 
 export async function getCachedQuote(ticker: string): Promise<LiveQuote | null> {
   const now = Date.now();
-  const cached = cache.get(ticker);
-  if (cached && now - cached.ts < CACHE_TTL) return cached.data;
+  const cached = quoteCache.get(ticker);
+  if (cached && now - cached.ts < QUOTE_CACHE_TTL) return cached.data;
 
   const data = await fetchFinnhubQuote(ticker);
   if (data) {
-    cache.set(ticker, { data, ts: now });
+    quoteCache.set(ticker, { data, ts: now });
   }
   return data;
 }
@@ -94,10 +101,104 @@ export async function getCachedQuotes(
   return results;
 }
 
+// ─── Daily price history (24M) via Finnhub ───────────────────────
+
+async function fetchFinnhubHistory(ticker: string): Promise<PricePoint[] | null> {
+  if (!FINNHUB_API_KEY) {
+    console.warn("[finnhub] FINNHUB_API_KEY not set; skipping history");
+    return null;
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  // ~2 years of data (730 days)
+  const fromSec = nowSec - 730 * 24 * 60 * 60;
+
+  const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(
+    ticker,
+  )}&resolution=D&from=${fromSec}&to=${nowSec}&token=${FINNHUB_API_KEY}`;
+
+  try {
+    const res = await fetch(url);
+    if (!res || !res.ok) {
+      console.warn(`[finnhub] history HTTP ${res?.status} for ${ticker}`);
+      return null;
+    }
+
+    const data = (await res.json()) as any;
+    if (!data || data.s !== "ok" || !Array.isArray(data.c) || !Array.isArray(data.t)) {
+      console.warn("[finnhub] bad history payload for", ticker, data?.s);
+      return null;
+    }
+
+    const points: PricePoint[] = [];
+    for (let i = 0; i < data.c.length; i++) {
+      const close = data.c[i];
+      const ts = data.t[i];
+      if (typeof close !== "number" || typeof ts !== "number") continue;
+      const date = new Date(ts * 1000).toISOString().slice(0, 10);
+      points.push({ date, price: close });
+    }
+
+    if (points.length === 0) return null;
+    return points;
+  } catch (err) {
+    console.warn("[finnhub] history fetch failed for", ticker, err);
+    return null;
+  }
+}
+
+export async function getPriceHistory24M(
+  ticker: string,
+): Promise<PricePoint[] | null> {
+  const now = Date.now();
+  const cached = historyCache.get(ticker);
+  if (cached && now - cached.ts < HISTORY_CACHE_TTL) return cached.data;
+
+  const data = await fetchFinnhubHistory(ticker);
+  if (data && data.length > 0) {
+    historyCache.set(ticker, { data, ts: now });
+    return data;
+  }
+  return null;
+}
+
+export function computeReturnsFromHistory(history: PricePoint[]): {
+  return12m: number | null;
+  return6m: number | null;
+  return3m: number | null;
+} {
+  if (history.length < 2) {
+    return { return12m: null, return6m: null, return3m: null };
+  }
+
+  const closes = history.map((p) => p.price);
+  const n = closes.length;
+
+  const idx12 = Math.max(0, n - 252);
+  const idx6 = Math.max(0, n - 126);
+  const idx3 = Math.max(0, n - 63);
+
+  const latest = closes[n - 1];
+
+  function calcReturn(oldIdx: number): number | null {
+    const start = closes[oldIdx];
+    if (!start || start <= 0 || !latest || latest <= 0) return null;
+    return Math.round(((latest - start) / start) * 10000) / 100;
+  }
+
+  return {
+    return12m: calcReturn(idx12),
+    return6m: calcReturn(idx6),
+    return3m: calcReturn(idx3),
+  };
+}
+
 export async function prewarmCache(): Promise<void> {
   const allTickers = getAllStocks().map((s) => s.ticker);
   const tickers = allTickers.slice(0, 50);
-  console.log(`[prewarm] Starting Finnhub cache warm for ${tickers.length} tickers...`);
+  console.log(
+    `[prewarm] Starting Finnhub cache warm for ${tickers.length} tickers...`,
+  );
 
   if (!FINNHUB_API_KEY) {
     console.warn("[finnhub] FINNHUB_API_KEY not set; skipping prewarm");
@@ -111,6 +212,9 @@ export async function prewarmCache(): Promise<void> {
     }
     console.log("[prewarm] Finnhub cache warm complete.");
   } catch (err) {
-    console.warn("[prewarm] Finnhub cache warm encountered errors (non-fatal):", err);
+    console.warn(
+      "[prewarm] Finnhub cache warm encountered errors (non-fatal):",
+      err,
+    );
   }
 }
