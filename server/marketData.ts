@@ -1,15 +1,15 @@
 import { getAllStocks } from "./stockData";
+import { getFundamentals } from "./fundamentalsCache";
 
 export interface LiveQuote {
   price: number | null;
   change: number | null;
   changePercent: number | null;
   volume: number | null;
-  marketCap: number | null;
+  marketCap: number | null; // in raw dollars (from FMP), or null
   name: string | null;
 }
 
-// Node 18+ / Render provide global fetch; declare it so TypeScript is happy.
 declare const fetch: (input: any, init?: any) => Promise<any>;
 
 const cache = new Map<string, { data: LiveQuote; ts: number }>();
@@ -23,9 +23,7 @@ async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
     return null;
   }
 
-  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
-    ticker,
-  )}&token=${FINNHUB_API_KEY}`;
+  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_API_KEY}`;
 
   try {
     const res = await fetch(url);
@@ -36,25 +34,28 @@ async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
 
     const data = (await res.json()) as any;
 
-    // Finnhub quote response:
-    // c: current price
-    // pc: previous close
-    const c = typeof data.c === "number" ? data.c : null;
+    const c = typeof data.c === "number" && data.c > 0 ? data.c : null;
     const pc = typeof data.pc === "number" ? data.pc : null;
 
     let change: number | null = null;
     let changePercent: number | null = null;
     if (c != null && pc != null && pc !== 0) {
-      change = c - pc;
-      changePercent = (change / pc) * 100;
+      change = Math.round((c - pc) * 100) / 100;
+      // Round to exactly 2 decimal places at source
+      changePercent = Math.round(((c - pc) / pc) * 10000) / 100;
     }
+
+    // Finnhub free tier does NOT return market cap.
+    // Pull it from the FMP fundamentals cache instead.
+    const fmp = getFundamentals(ticker);
+    const marketCap = fmp?.marketCap ?? null;
 
     return {
       price: c,
       change,
       changePercent,
       volume: null,
-      marketCap: null,
+      marketCap,
       name: null,
     };
   } catch (err) {
@@ -79,22 +80,16 @@ export async function getCachedQuotes(
   tickers: string[],
 ): Promise<Map<string, LiveQuote | null>> {
   const results = new Map<string, LiveQuote | null>();
-
   for (const t of tickers) {
     results.set(t, await getCachedQuote(t));
   }
-
   return results;
 }
 
-// Pre-warm: fetch a limited subset of tickers in background after server starts
-// to avoid exhausting Finnhub free-tier limits.
 export async function prewarmCache(): Promise<void> {
   const allTickers = getAllStocks().map((s) => s.ticker);
-  const tickers = allTickers.slice(0, 50); // warm top 50 only
-  console.log(
-    `[prewarm] Starting Finnhub cache warm for ${tickers.length} tickers...`,
-  );
+  const tickers = allTickers.slice(0, 50);
+  console.log(`[prewarm] Starting Finnhub cache warm for ${tickers.length} tickers...`);
 
   if (!FINNHUB_API_KEY) {
     console.warn("[finnhub] FINNHUB_API_KEY not set; skipping prewarm");
@@ -104,15 +99,10 @@ export async function prewarmCache(): Promise<void> {
   try {
     for (const t of tickers) {
       await getCachedQuote(t);
-      // Small delay between calls to respect rate limits
       await new Promise((r) => setTimeout(r, 200));
     }
     console.log("[prewarm] Finnhub cache warm complete.");
   } catch (err) {
-    console.warn(
-      "[prewarm] Finnhub cache warm encountered errors (non-fatal):",
-      err,
-    );
+    console.warn("[prewarm] Finnhub cache warm encountered errors (non-fatal):", err);
   }
 }
-
