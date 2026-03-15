@@ -10,6 +10,14 @@ export interface LiveQuote {
   name: string | null;
 }
 
+// A stock is considered tradable if we have a positive live price.
+export function isTradableQuote(q: LiveQuote | null): boolean {
+  if (!q) return false;
+  if (typeof q.price !== "number") return false;
+  if (q.price <= 0) return false;
+  return true;
+}
+
 declare const fetch: (input: any, init?: any) => Promise<any>;
 
 const cache = new Map<string, { data: LiveQuote; ts: number }>();
