@@ -1,5 +1,6 @@
 import type { StockScore, BacktestPoint, BacktestResult, BacktestHolding, HeatmapSector, HeatmapCell, PricePoint, PeerComparison, StockDetail, FactorWeights, PortfolioHolding, PortfolioSummary } from "@shared/schema";
 import { getFundamentals, getCacheStatus } from "./fundamentalsCache";
+import { getHistoryMetrics, registerStockCacheInvalidator } from "./marketData";
 
 // Deterministic pseudo-random number generator (seeded by ticker string)
 function seededRandom(seed: string): () => number {
@@ -230,7 +231,6 @@ const ALL_STOCKS: StockDef[] = [
   { ticker: "MMM", name: "3M Company", sector: "Industrials", exchange: "NYSE" },
   { ticker: "WM", name: "Waste Management", sector: "Industrials", exchange: "NYSE" },
   { ticker: "RSG", name: "Republic Services", sector: "Industrials", exchange: "NYSE" },
-  { ticker: "UBER", name: "Uber Technologies", sector: "Industrials", exchange: "NYSE" },
   { ticker: "CSX", name: "CSX Corp", sector: "Industrials", exchange: "NASDAQ" },
   { ticker: "NSC", name: "Norfolk Southern", sector: "Industrials", exchange: "NYSE" },
   { ticker: "DAL", name: "Delta Air Lines", sector: "Industrials", exchange: "NYSE" },
@@ -351,15 +351,26 @@ function generateStockScore(def: StockDef): StockScore {
   const mcBase = 10 + rng() * 800;
   const marketCap = round(mcBase, 1);
 
-  const return12m = round((rng() - 0.3) * 80);
-  const return6m = round((rng() - 0.35) * 50);
-  const return3m = round((rng() - 0.4) * 30);
+  // Seeded fallback returns (used only when Yahoo history not yet cached)
+  const seededReturn12m = round((rng() - 0.3) * 80);
+  const seededReturn6m = round((rng() - 0.35) * 50);
+  const seededReturn3m = round((rng() - 0.4) * 30);
+
+  // ── Use real Yahoo history metrics if available ──────────────────
+  const histMetrics = getHistoryMetrics(def.ticker);
+  const return12m = histMetrics?.return12m ?? seededReturn12m;
+  const return6m = histMetrics?.return6m ?? seededReturn6m;
+  const return3m = histMetrics?.return3m ?? seededReturn3m;
 
   const roe = round(5 + rng() * 35 + profile.qualityBias * 0.3);
   const profitMargin = round(3 + rng() * 35 + profile.qualityBias * 0.4);
   const debtToEquity = round(0.1 + rng() * 2.5 - profile.qualityBias * 0.02);
   const beta = round(profile.betaBase + (rng() - 0.5) * 0.6, 2);
-  const volatility52w = round(15 + rng() * 40 - profile.volBias * 0.3);
+
+  // Use real 52W volatility from Yahoo history if available, else seeded
+  const seededVol = round(15 + rng() * 40 - profile.volBias * 0.3);
+  const volatility52w = histMetrics?.volatility52w ?? seededVol;
+
   const pe = round(8 + rng() * 45 - profile.valueBias * 0.3);
   const pb = round(0.8 + rng() * 12 - profile.valueBias * 0.1);
   const dividendYield = round(Math.max(0, rng() * 5 + profile.valueBias * 0.05), 2);
@@ -372,7 +383,8 @@ function generateStockScore(def: StockDef): StockScore {
   const fmp = getFundamentals(def.ticker);
   const cacheReady = getCacheStatus().status === "ready";
 
-  // Factor scores — use FMP real data if available, else seeded fallback
+  // ── Factor scores ────────────────────────────────────────────────
+  // Momentum: always computed from real returns (Yahoo if cached, seeded fallback)
   const momRaw = return12m * 0.5 + return6m * 0.3 + return3m * 0.2;
   const momentum = clamp(Math.round(50 + momRaw * 1.2), 0, 100);
 
@@ -380,6 +392,7 @@ function generateStockScore(def: StockDef): StockScore {
     ? fmp.qualityScore
     : clamp(Math.round((roe / 40) * 40 + (profitMargin / 35) * 30 + ((2.5 - debtToEquity) / 2.5) * 30 + profile.qualityBias), 0, 100);
 
+  // Low volatility: use real vol52w in score formula
   const lowVol = (cacheReady && fmp?.lowVolScore != null)
     ? fmp.lowVolScore
     : clamp(Math.round(((2 - beta) / 2) * 50 + ((60 - volatility52w) / 60) * 50 + profile.volBias), 0, 100);
@@ -422,7 +435,9 @@ function generateStockScore(def: StockDef): StockScore {
     insider,
     composite: 0,
     metrics: {
-      return12m, return6m, return3m,
+      return12m,
+      return6m,
+      return3m,
       roe: finalROE,
       profitMargin: finalProfitMargin,
       debtToEquity: finalDebtToEquity,
@@ -439,13 +454,23 @@ function generateStockScore(def: StockDef): StockScore {
   };
 }
 
-// Re-generate scores after FMP cache is ready
+// ─── Stock score cache ────────────────────────────────────────────
+// Invalidated when: (a) FMP cache becomes ready, (b) Yahoo history prewarm completes
+
 let cachedStocks: StockScore[] | null = null;
 let lastCacheStatus = "empty";
 
+export function invalidateStockScoreCache() {
+  cachedStocks = null;
+  console.log("[stockData] Score cache invalidated — will regenerate on next request");
+}
+
+// Register invalidator with marketData so it's called after history prewarm
+registerStockCacheInvalidator(invalidateStockScoreCache);
+
 export function getAllStocks(): StockScore[] {
   const currentStatus = getCacheStatus().status;
-  // Regenerate if FMP cache just became ready
+  // Regenerate if cache cleared or FMP just became ready
   if (!cachedStocks || (currentStatus === "ready" && lastCacheStatus !== "ready")) {
     cachedStocks = ALL_STOCKS.map(generateStockScore);
     lastCacheStatus = currentStatus;
@@ -469,7 +494,6 @@ export function computeComposite(
   return Math.round(score * 10) / 10;
 }
 
-// Top N to return from screener and use in portfolio/backtest
 const SCREENER_TOP_N = 50;
 const PORTFOLIO_TOP_N = 25;
 
@@ -481,7 +505,6 @@ export function getScreenedStocks(weights: {
     composite: computeComposite(s, weights),
   }));
   stocks.sort((a, b) => b.composite - a.composite);
-  // Return top 50 only — this IS the screening step
   return stocks.slice(0, SCREENER_TOP_N);
 }
 
@@ -493,7 +516,9 @@ export const SECTORS = [
 
 export const EXCHANGES = ["NYSE", "NASDAQ"];
 
-// ─── Price History ───────────────────────────────────────────────
+// ─── Price History ────────────────────────────────────────────────
+// NOTE: generatePriceHistory is only used for backtest simulation.
+// Stock detail pages use real Yahoo history via getPriceHistory24M in routes.ts.
 
 export function generatePriceHistory(ticker: string, months: number = 24): PricePoint[] {
   const rng = seededRandom(ticker + "-price-history");
@@ -533,7 +558,7 @@ export function getPeers(ticker: string, weights: FactorWeights): PeerComparison
   }));
 }
 
-// ─── Stock Detail ────────────────────────────────────────────────
+// ─── Stock Detail ─────────────────────────────────────────────────
 
 const STOCK_DESCRIPTIONS: Record<string, string> = {
   "AAPL": "Consumer electronics, software, and services. Known for iPhone, Mac, iPad, and Services ecosystem.",
@@ -603,24 +628,18 @@ export function runBacktest(weights: FactorWeights, period: "1y" | "3y" | "5y"):
     let weightedReturn = 0;
     for (const h of portfolio) {
       const prices = stockPrices.get(h.ticker)!;
-      const prevPrice = prices[i - 1];
-      const curPrice = prices[i];
-      const stockReturn = prevPrice > 0 ? (curPrice - prevPrice) / prevPrice : 0;
+      const stockReturn = prices[i - 1] > 0 ? (prices[i] - prices[i - 1]) / prices[i - 1] : 0;
       weightedReturn += (h.weight / 100) * stockReturn;
     }
     portfolioValue = round(portfolioValue * (1 + weightedReturn), 2);
     maxPortfolio = Math.max(maxPortfolio, portfolioValue);
-    const dd = (maxPortfolio - portfolioValue) / maxPortfolio;
-    maxDrawdown = Math.max(maxDrawdown, dd);
+    maxDrawdown = Math.max(maxDrawdown, (maxPortfolio - portfolioValue) / maxPortfolio);
     points.push({ month: d.toISOString().slice(0, 7), portfolioValue, benchmarkValue: benchmarkPrices[i] });
   }
   const holdings: BacktestHolding[] = portfolio.map((h) => {
     const prices = stockPrices.get(h.ticker)!;
-    const startPrice = prices[0];
-    const endPrice = prices[prices.length - 1];
-    const totalStockReturn = startPrice > 0 ? round(((endPrice - startPrice) / startPrice) * 100, 2) : 0;
-    const returnContribution = round((h.weight / 100) * totalStockReturn, 2);
-    return { ticker: h.ticker, name: h.name, sector: h.sector, exchange: h.exchange, weight: h.weight, compositeScore: h.composite, returnContribution, totalReturn: totalStockReturn };
+    const totalStockReturn = prices[0] > 0 ? round(((prices[prices.length - 1] - prices[0]) / prices[0]) * 100, 2) : 0;
+    return { ticker: h.ticker, name: h.name, sector: h.sector, exchange: h.exchange, weight: h.weight, compositeScore: h.composite, returnContribution: round((h.weight / 100) * totalStockReturn, 2), totalReturn: totalStockReturn };
   });
   holdings.sort((a, b) => b.weight - a.weight);
   const totalReturn = round(((portfolioValue - 10000) / 10000) * 100, 2);
@@ -633,19 +652,14 @@ export function runBacktest(weights: FactorWeights, period: "1y" | "3y" | "5y"):
   const avgMonthly = monthlyReturns.reduce((a, b) => a + b, 0) / monthlyReturns.length;
   const stdMonthly = Math.sqrt(monthlyReturns.reduce((a, b) => a + (b - avgMonthly) ** 2, 0) / monthlyReturns.length);
   const sharpe = stdMonthly > 0 ? round((avgMonthly * 12 - 0.04) / (stdMonthly * Math.sqrt(12)), 2) : 0;
-  const sectorMap = new Map<string, number>();
-  const exchangeMap = new Map<string, number>();
-  for (const h of holdings) {
-    sectorMap.set(h.sector, (sectorMap.get(h.sector) || 0) + h.weight);
-    exchangeMap.set(h.exchange, (exchangeMap.get(h.exchange) || 0) + h.weight);
-  }
-  const sectorBreakdown = Array.from(sectorMap).map(([sector, weight]) => ({ sector, weight: round(weight, 1) })).sort((a, b) => b.weight - a.weight);
-  const exchangeBreakdown = Array.from(exchangeMap).map(([exchange, weight]) => ({ exchange, weight: round(weight, 1) })).sort((a, b) => b.weight - a.weight);
+  const sectorMap = new Map<string, number>(); const exchangeMap = new Map<string, number>();
+  for (const h of holdings) { sectorMap.set(h.sector, (sectorMap.get(h.sector) || 0) + h.weight); exchangeMap.set(h.exchange, (exchangeMap.get(h.exchange) || 0) + h.weight); }
   return {
     period, weights, points, totalReturn, benchmarkReturn, annualizedReturn, benchmarkAnnualized,
     maxDrawdown: round(maxDrawdown * 100, 2), sharpeRatio: sharpe, alpha: round(annualizedReturn - benchmarkAnnualized, 2),
     holdings, holdingCount: PORTFOLIO_TOP_N, weightingMethod: "score-weighted", rebalanceFrequency: "monthly",
-    sectorBreakdown, exchangeBreakdown,
+    sectorBreakdown: Array.from(sectorMap).map(([sector, weight]) => ({ sector, weight: round(weight, 1) })).sort((a, b) => b.weight - a.weight),
+    exchangeBreakdown: Array.from(exchangeMap).map(([exchange, weight]) => ({ exchange, weight: round(weight, 1) })).sort((a, b) => b.weight - a.weight),
   };
 }
 
@@ -659,27 +673,28 @@ export function buildPortfolio(weights: FactorWeights): PortfolioSummary {
   const holdings: PortfolioHolding[] = scored.map((st) => {
     const weight = totalScore > 0 ? round((st.composite / totalScore) * 100, 2) : round(100 / PORTFOLIO_TOP_N, 2);
     const marketValue = round(portfolioValue * (weight / 100), 2);
-    const shares = round(marketValue / st.price, 4);
-    return {
-      ticker: st.ticker, name: st.name, sector: st.sector, exchange: st.exchange,
-      price: st.price, change1d: st.change1d, compositeScore: st.composite, weight, shares, marketValue,
-      momentum: st.momentum, quality: st.quality, lowVol: st.lowVol, valuation: st.valuation, erm: st.erm, insider: st.insider,
-    };
+    return { ticker: st.ticker, name: st.name, sector: st.sector, exchange: st.exchange, price: st.price, change1d: st.change1d, compositeScore: st.composite, weight, shares: round(marketValue / st.price, 4), marketValue, momentum: st.momentum, quality: st.quality, lowVol: st.lowVol, valuation: st.valuation, erm: st.erm, insider: st.insider };
   });
   const avgComposite = round(holdings.reduce((s, h) => s + h.compositeScore, 0) / holdings.length, 1);
-  const weightedBeta = round(holdings.reduce((s, h) => { const stock = getAllStocks().find((st) => st.ticker === h.ticker); return s + (h.weight / 100) * (stock?.metrics.beta ?? 1); }, 0), 2);
-  const weightedDividendYield = round(holdings.reduce((s, h) => { const stock = getAllStocks().find((st) => st.ticker === h.ticker); return s + (h.weight / 100) * (stock?.metrics.dividendYield ?? 0); }, 0), 2);
-  const weightedPE = round(holdings.reduce((s, h) => { const stock = getAllStocks().find((st) => st.ticker === h.ticker); return s + (h.weight / 100) * (stock?.metrics.pe ?? 20); }, 0), 1);
+  const allS = getAllStocks();
+  const weightedBeta = round(holdings.reduce((s, h) => { const st = allS.find((x) => x.ticker === h.ticker); return s + (h.weight / 100) * (st?.metrics.beta ?? 1); }, 0), 2);
+  const weightedDividendYield = round(holdings.reduce((s, h) => { const st = allS.find((x) => x.ticker === h.ticker); return s + (h.weight / 100) * (st?.metrics.dividendYield ?? 0); }, 0), 2);
+  const weightedPE = round(holdings.reduce((s, h) => { const st = allS.find((x) => x.ticker === h.ticker); return s + (h.weight / 100) * (st?.metrics.pe ?? 20); }, 0), 1);
   const sectorAgg = new Map<string, { weight: number; count: number }>();
-  for (const h of holdings) { const e = sectorAgg.get(h.sector) || { weight: 0, count: 0 }; e.weight += h.weight; e.count += 1; sectorAgg.set(h.sector, e); }
-  const sectorBreakdown = Array.from(sectorAgg).map(([sector, v]) => ({ sector, weight: round(v.weight, 1), count: v.count })).sort((a, b) => b.weight - a.weight);
   const exchAgg = new Map<string, { weight: number; count: number }>();
-  for (const h of holdings) { const e = exchAgg.get(h.exchange) || { weight: 0, count: 0 }; e.weight += h.weight; e.count += 1; exchAgg.set(h.exchange, e); }
-  const exchangeBreakdown = Array.from(exchAgg).map(([exchange, v]) => ({ exchange, weight: round(v.weight, 1), count: v.count })).sort((a, b) => b.weight - a.weight);
+  for (const h of holdings) {
+    const se = sectorAgg.get(h.sector) || { weight: 0, count: 0 }; se.weight += h.weight; se.count += 1; sectorAgg.set(h.sector, se);
+    const ee = exchAgg.get(h.exchange) || { weight: 0, count: 0 }; ee.weight += h.weight; ee.count += 1; exchAgg.set(h.exchange, ee);
+  }
   const sortedByWeight = [...holdings].sort((a, b) => b.weight - a.weight);
-  const topHolding = { ticker: sortedByWeight[0].ticker, weight: sortedByWeight[0].weight };
-  const top5Weight = round(sortedByWeight.slice(0, 5).reduce((s, h) => s + h.weight, 0), 1);
-  return { holdings, totalValue: portfolioValue, holdingCount: PORTFOLIO_TOP_N, weightingMethod: "score-weighted", avgComposite, weightedBeta, weightedDividendYield, weightedPE, sectorBreakdown, exchangeBreakdown, topHolding, top5Weight };
+  return {
+    holdings, totalValue: portfolioValue, holdingCount: PORTFOLIO_TOP_N, weightingMethod: "score-weighted",
+    avgComposite, weightedBeta, weightedDividendYield, weightedPE,
+    sectorBreakdown: Array.from(sectorAgg).map(([sector, v]) => ({ sector, weight: round(v.weight, 1), count: v.count })).sort((a, b) => b.weight - a.weight),
+    exchangeBreakdown: Array.from(exchAgg).map(([exchange, v]) => ({ exchange, weight: round(v.weight, 1), count: v.count })).sort((a, b) => b.weight - a.weight),
+    topHolding: { ticker: sortedByWeight[0].ticker, weight: sortedByWeight[0].weight },
+    top5Weight: round(sortedByWeight.slice(0, 5).reduce((s, h) => s + h.weight, 0), 1),
+  };
 }
 
 export function getSectorHeatmap(weights: FactorWeights): HeatmapSector[] {
@@ -693,8 +708,7 @@ export function getSectorHeatmap(weights: FactorWeights): HeatmapSector[] {
   const result: HeatmapSector[] = [];
   for (const [sector, cells] of sectorMap) {
     cells.sort((a, b) => b.marketCap - a.marketCap);
-    const avgComposite = round(cells.reduce((a, c) => a + c.composite, 0) / cells.length, 1);
-    result.push({ sector, stocks: cells, avgComposite });
+    result.push({ sector, stocks: cells, avgComposite: round(cells.reduce((a, c) => a + c.composite, 0) / cells.length, 1) });
   }
   result.sort((a, b) => b.avgComposite - a.avgComposite);
   return result;
