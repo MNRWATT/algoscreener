@@ -7,7 +7,7 @@ export interface LiveQuote {
   change: number | null;
   changePercent: number | null;
   volume: number | null;
-  marketCap: number | null; // in raw dollars (from FMP), or null
+  marketCap: number | null;
   name: string | null;
 }
 
@@ -24,11 +24,13 @@ declare const fetch: (input: any, init?: any) => Promise<any>;
 const quoteCache = new Map<string, { data: LiveQuote; ts: number }>();
 const QUOTE_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 
-// Daily price history (24M) cache
+// Daily price history (24M) cache — 24 hour TTL
 const historyCache = new Map<string, { data: PricePoint[]; ts: number }>();
-const HISTORY_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const HISTORY_CACHE_TTL = 24 * 60 * 60 * 1000;
 
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+
+// ─── Live quote via Finnhub ──────────────────────────────────────
 
 async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
   if (!FINNHUB_API_KEY) {
@@ -56,23 +58,13 @@ async function fetchFinnhubQuote(ticker: string): Promise<LiveQuote | null> {
     let changePercent: number | null = null;
     if (c != null && pc != null && pc !== 0) {
       change = Math.round((c - pc) * 100) / 100;
-      // Round to exactly 2 decimal places at source
       changePercent = Math.round(((c - pc) / pc) * 10000) / 100;
     }
 
-    // Finnhub free tier does NOT return market cap.
-    // Pull it from the FMP fundamentals cache instead.
     const fmp = getFundamentals(ticker);
     const marketCap = fmp?.marketCap ?? null;
 
-    return {
-      price: c,
-      change,
-      changePercent,
-      volume: null,
-      marketCap,
-      name: null,
-    };
+    return { price: c, change, changePercent, volume: null, marketCap, name: null };
   } catch (err) {
     console.warn("[finnhub] fetch failed for", ticker, err);
     return null;
@@ -83,11 +75,8 @@ export async function getCachedQuote(ticker: string): Promise<LiveQuote | null> 
   const now = Date.now();
   const cached = quoteCache.get(ticker);
   if (cached && now - cached.ts < QUOTE_CACHE_TTL) return cached.data;
-
   const data = await fetchFinnhubQuote(ticker);
-  if (data) {
-    quoteCache.set(ticker, { data, ts: now });
-  }
+  if (data) quoteCache.set(ticker, { data, ts: now });
   return data;
 }
 
@@ -101,48 +90,67 @@ export async function getCachedQuotes(
   return results;
 }
 
-// ─── Daily price history (24M) via Finnhub ───────────────────────
+// ─── Daily price history (24M) via Yahoo Finance v8 ─────────────
+//
+// Uses Yahoo's free public chart API — no API key required.
+// endpoint: https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}?interval=1d&range=2y
 
-async function fetchFinnhubHistory(ticker: string): Promise<PricePoint[] | null> {
-  if (!FINNHUB_API_KEY) {
-    console.warn("[finnhub] FINNHUB_API_KEY not set; skipping history");
-    return null;
-  }
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  // ~2 years of data (730 days)
-  const fromSec = nowSec - 730 * 24 * 60 * 60;
-
-  const url = `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(
-    ticker,
-  )}&resolution=D&from=${fromSec}&to=${nowSec}&token=${FINNHUB_API_KEY}`;
+async function fetchYahooHistory(ticker: string): Promise<PricePoint[] | null> {
+  // Yahoo uses "-" instead of "." for some tickers (e.g. BRK-B stays BRK-B)
+  const yahooSymbol = ticker.replace(".", "-");
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+    yahooSymbol,
+  )}?interval=1d&range=2y`;
 
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, {
+      headers: {
+        // Yahoo requires a browser-like User-Agent to avoid 401s
+        "User-Agent": "Mozilla/5.0 (compatible; AlgoScreener/1.0)",
+        "Accept": "application/json",
+      },
+    });
+
     if (!res || !res.ok) {
-      console.warn(`[finnhub] history HTTP ${res?.status} for ${ticker}`);
+      console.warn(`[yahoo] HTTP ${res?.status} for ${ticker}`);
       return null;
     }
 
-    const data = (await res.json()) as any;
-    if (!data || data.s !== "ok" || !Array.isArray(data.c) || !Array.isArray(data.t)) {
-      console.warn("[finnhub] bad history payload for", ticker, data?.s);
+    const json = (await res.json()) as any;
+    const result = json?.chart?.result?.[0];
+    if (!result) {
+      console.warn(`[yahoo] no result for ${ticker}`);
+      return null;
+    }
+
+    const timestamps: number[] = result.timestamp ?? [];
+    const closes: number[] = result.indicators?.quote?.[0]?.close ?? [];
+
+    if (timestamps.length === 0 || closes.length === 0) {
+      console.warn(`[yahoo] empty timestamps/closes for ${ticker}`);
       return null;
     }
 
     const points: PricePoint[] = [];
-    for (let i = 0; i < data.c.length; i++) {
-      const close = data.c[i];
-      const ts = data.t[i];
-      if (typeof close !== "number" || typeof ts !== "number") continue;
+    for (let i = 0; i < timestamps.length; i++) {
+      const close = closes[i];
+      const ts = timestamps[i];
+      // Skip null/undefined closes (market holidays etc.)
+      if (close == null || typeof close !== "number" || !isFinite(close)) continue;
+      if (typeof ts !== "number") continue;
       const date = new Date(ts * 1000).toISOString().slice(0, 10);
-      points.push({ date, price: close });
+      points.push({ date, price: Math.round(close * 100) / 100 });
     }
 
-    if (points.length === 0) return null;
+    if (points.length === 0) {
+      console.warn(`[yahoo] all closes were null for ${ticker}`);
+      return null;
+    }
+
+    console.log(`[yahoo] fetched ${points.length} daily closes for ${ticker}`);
     return points;
   } catch (err) {
-    console.warn("[finnhub] history fetch failed for", ticker, err);
+    console.warn("[yahoo] history fetch failed for", ticker, err);
     return null;
   }
 }
@@ -154,13 +162,15 @@ export async function getPriceHistory24M(
   const cached = historyCache.get(ticker);
   if (cached && now - cached.ts < HISTORY_CACHE_TTL) return cached.data;
 
-  const data = await fetchFinnhubHistory(ticker);
+  const data = await fetchYahooHistory(ticker);
   if (data && data.length > 0) {
     historyCache.set(ticker, { data, ts: now });
     return data;
   }
   return null;
 }
+
+// ─── Compute momentum returns from price history ─────────────────
 
 export function computeReturnsFromHistory(history: PricePoint[]): {
   return12m: number | null;
@@ -174,6 +184,7 @@ export function computeReturnsFromHistory(history: PricePoint[]): {
   const closes = history.map((p) => p.price);
   const n = closes.length;
 
+  // Approximate trading days: 252/year, 126/6mo, 63/3mo
   const idx12 = Math.max(0, n - 252);
   const idx6 = Math.max(0, n - 126);
   const idx3 = Math.max(0, n - 63);
@@ -192,6 +203,8 @@ export function computeReturnsFromHistory(history: PricePoint[]): {
     return3m: calcReturn(idx3),
   };
 }
+
+// ─── Startup cache warm ──────────────────────────────────────────
 
 export async function prewarmCache(): Promise<void> {
   const allTickers = getAllStocks().map((s) => s.ticker);
