@@ -14,7 +14,7 @@ app.use(express.urlencoded({ extended: false }));
 if (process.env.NODE_ENV === "production") {
   const distPublic = path.join(__dirname, "../dist/public");
   app.use(express.static(distPublic));
-  app.get("*", (_req: any, res: any) => {
+  app.get("/*splat", (_req: any, res: any) => {
     res.sendFile(path.join(distPublic, "index.html"));
   });
 }
