@@ -30,7 +30,7 @@ function getMarketRegime(): MarketRegime {
   if (vix >= 30) { suggestedWeights = { momentum: 5, quality: 30, lowVol: 35, valuation: 15, erm: 5, insider: 10 }; regimeName = "Risk-Off"; regimeDescription = "High volatility regime. Maximum defensive positioning with quality and low-volatility tilt."; }
   else if (vix < 15 && sp500Ytd > 5) { suggestedWeights = { momentum: 35, quality: 20, lowVol: 10, valuation: 10, erm: 20, insider: 5 }; regimeName = "Risk-On"; regimeDescription = "Low volatility, positive trend. Lean into momentum and growth with quality backstop."; }
   else if (yieldSpread10y2y < -0.2) { suggestedWeights = { momentum: 10, quality: 30, lowVol: 25, valuation: 20, erm: 5, insider: 10 }; regimeName = "Late Cycle"; regimeDescription = "Inverted yield curve signals slowdown ahead. Defensive quality + value positioning."; }
-  return { vix, vixLabel, yieldSpread10y2y, yieldCurveLabel, fedRate: "3.50–3.75%", fedOutlook: "On hold, 1–2 cuts expected by year-end", sp500Ytd, recessionProb, inflationRate, gdpGrowth, geopoliticalRisk: "Elevated", regimeName, regimeDescription, suggestedWeights, lastUpdated: new Date().toISOString() };
+  return { vix, vixLabel, yieldSpread10y2y, yieldCurveLabel, fedRate: "3.50-3.75%", fedOutlook: "On hold, 1-2 cuts expected by year-end", sp500Ytd, recessionProb, inflationRate, gdpGrowth, geopoliticalRisk: "Elevated", regimeName, regimeDescription, suggestedWeights, lastUpdated: new Date().toISOString() };
 }
 
 const watchlist: Map<string, WatchlistItem> = new Map();
@@ -57,36 +57,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/screener", async (req, res) => {
     try {
       const weights = parseWeights(req.query as Record<string, unknown>);
-      // getScreenedStocks already slices to top 50 after scoring all ~250 stocks
       const stocks = getScreenedStocks(weights);
       const liveQuotes = await getCachedQuotes(stocks.map((s) => s.ticker));
-      const enriched = stocks
-        .map((s) => {
-          const q = liveQuotes.get(s.ticker) ?? null;
-          const price = live(q?.price);
-          return {
-            ...s,
-            price,
-            change1d: live(q?.changePercent),
-            marketCap:
-              q?.marketCap != null
-                ? Math.round((q.marketCap / 1e9) * 10) / 10
-                : null,
-            name: q?.name ?? s.name,
-            _hasLiveQuote: isTradableQuote(q),
-          };
-        })
-        .filter((row) => row._hasLiveQuote)
-        .map(({ _hasLiveQuote, ...rest }) => rest);
+      const enriched = stocks.map((s) => {
+        const q = liveQuotes.get(s.ticker) ?? null;
+        return {
+          ...s,
+          price: live(q?.price),
+          change1d: live(q?.changePercent),
+          marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
+          name: q?.name ?? s.name,
+        };
+      });
       const cacheInfo = getCacheStatus();
       res.json({
         stocks: enriched,
         lastUpdated: new Date().toISOString(),
         universe: `S&P 500 + NASDAQ 100 (US only, top 50 of ${getAllStocks().length})`,
-        fundamentalsSource:
-          cacheInfo.fmpEnabled && cacheInfo.status === "ready"
-            ? "FMP real data"
-            : "seeded model",
+        fundamentalsSource: cacheInfo.fmpEnabled && cacheInfo.status === "ready" ? "FMP real data" : "seeded model",
       });
     } catch (err) {
       console.error("[screener] error:", err);
@@ -98,8 +86,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/exchanges", (_req, res) => res.json(EXCHANGES));
   app.get("/api/market-regime", (_req, res) => res.json(getMarketRegime()));
   app.get("/api/presets", (_req, res) => res.json(PRESETS));
-
-  // Expose cache status so the UI can show a "Live Data" vs "Model" badge
   app.get("/api/cache-status", (_req, res) => res.json(getCacheStatus()));
 
   app.get("/api/stock/:ticker", async (req, res) => {
@@ -112,10 +98,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return;
       }
 
-      // Overlay live quote
       const q = await getCachedQuote(ticker);
-
-      // Overlay real 24M price history + momentum returns when available
       const history = await getPriceHistory24M(ticker);
       let priceHistory = detail.priceHistory;
       let metrics = detail.metrics;
@@ -131,25 +114,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
           return6m: returns.return6m ?? metrics.return6m,
           return3m: returns.return3m ?? metrics.return3m,
         };
-        if (
-          returns.return12m !== null ||
-          returns.return6m !== null ||
-          returns.return3m !== null
-        ) {
+        if (returns.return12m !== null || returns.return6m !== null || returns.return3m !== null) {
           const r12 = returns.return12m ?? 0;
           const r6 = returns.return6m ?? 0;
           const r3 = returns.return3m ?? 0;
           const momRaw = r12 * 0.5 + r6 * 0.3 + r3 * 0.2;
-          const newMomentum = Math.max(
-            0,
-            Math.min(100, Math.round(50 + momRaw * 1.2)),
-          );
+          const newMomentum = Math.max(0, Math.min(100, Math.round(50 + momRaw * 1.2)));
           momentum = newMomentum;
-          const updated: StockScore = {
-            ...detail,
-            momentum,
-            metrics,
-          };
+          const updated: StockScore = { ...detail, momentum, metrics };
           composite = computeComposite(updated, weights);
         }
       }
@@ -158,10 +130,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         ...detail,
         price: live(q?.price),
         change1d: live(q?.changePercent),
-        marketCap:
-          q?.marketCap != null
-            ? Math.round((q.marketCap / 1e9) * 10) / 10
-            : null,
+        marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
         name: q?.name ?? detail.name,
         priceHistory,
         metrics,
@@ -207,21 +176,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const weights = parseWeights(req.query as Record<string, unknown>);
       const portfolio = buildPortfolio(weights);
-      const liveQuotes = await getCachedQuotes(
-        portfolio.holdings.map((h) => h.ticker),
-      );
-      const enrichedHoldings = portfolio.holdings
-        .map((h) => {
-          const q = liveQuotes.get(h.ticker) ?? null;
-          return {
-            ...h,
-            price: live(q?.price),
-            change1d: live(q?.changePercent),
-            _hasLiveQuote: isTradableQuote(q),
-          };
-        })
-        .filter((h) => h._hasLiveQuote)
-        .map(({ _hasLiveQuote, ...rest }) => rest);
+      const liveQuotes = await getCachedQuotes(portfolio.holdings.map((h) => h.ticker));
+      const enrichedHoldings = portfolio.holdings.map((h) => {
+        const q = liveQuotes.get(h.ticker) ?? null;
+        return {
+          ...h,
+          price: live(q?.price),
+          change1d: live(q?.changePercent),
+        };
+      });
       res.json({ ...portfolio, holdings: enrichedHoldings });
     } catch (err) {
       console.error("[portfolio] error:", err);
@@ -233,28 +196,19 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const weights = parseWeights(req.query as Record<string, unknown>);
       const heatmap = getSectorHeatmap(weights);
-      const allTickers = heatmap.flatMap((sector) =>
-        sector.stocks.map((s) => s.ticker),
-      );
+      const allTickers = heatmap.flatMap((sector) => sector.stocks.map((s) => s.ticker));
       const liveQuotes = await getCachedQuotes(allTickers);
       const enriched = heatmap.map((sector) => ({
         ...sector,
-        stocks: sector.stocks
-          .map((s) => {
-            const q = liveQuotes.get(s.ticker) ?? null;
-            return {
-              ...s,
-              change1d: live(q?.changePercent),
-              price: live(q?.price),
-              marketCap:
-                q?.marketCap != null
-                  ? Math.round((q.marketCap / 1e9) * 10) / 10
-                  : null,
-              _hasLiveQuote: isTradableQuote(q),
-            };
-          })
-          .filter((s) => s._hasLiveQuote)
-          .map(({ _hasLiveQuote, ...rest }) => rest),
+        stocks: sector.stocks.map((s) => {
+          const q = liveQuotes.get(s.ticker) ?? null;
+          return {
+            ...s,
+            change1d: live(q?.changePercent),
+            price: live(q?.price),
+            marketCap: q?.marketCap != null ? Math.round((q.marketCap / 1e9) * 10) / 10 : null,
+          };
+        }),
       }));
       res.json(enriched);
     } catch (err) {
@@ -263,20 +217,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/watchlist", (_req, res) =>
-    res.json(Array.from(watchlist.values())),
-  );
+  app.get("/api/watchlist", (_req, res) => res.json(Array.from(watchlist.values())));
   app.post("/api/watchlist/:ticker", (req, res) => {
     const { ticker } = req.params;
     const stock = getAllStocks().find((s) => s.ticker === ticker);
-    if (!stock) {
-      res.status(404).json({ error: "Stock not found" });
-      return;
-    }
-    if (watchlist.has(ticker)) {
-      res.json({ message: "Already in watchlist" });
-      return;
-    }
+    if (!stock) { res.status(404).json({ error: "Stock not found" }); return; }
+    if (watchlist.has(ticker)) { res.json({ message: "Already in watchlist" }); return; }
     watchlist.set(ticker, { ticker, addedAt: new Date().toISOString() });
     res.json({ message: "Added to watchlist", item: watchlist.get(ticker) });
   });
@@ -285,15 +231,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json({ message: "Removed from watchlist" });
   });
 
-  app.get("/api/alerts", (_req, res) =>
-    res.json(
-      alerts.sort(
-        (a, b) =>
-          new Date(b.createdAt).getTime() -
-          new Date(a.createdAt).getTime(),
-      ),
-    ),
-  );
+  app.get("/api/alerts", (_req, res) => res.json(alerts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())));
   app.post("/api/alerts/read/:id", (req, res) => {
     const a = alerts.find((a) => a.id === req.params.id);
     if (a) a.read = true;
@@ -321,24 +259,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     if (rule.type === "score_above" && rule.ticker && rule.threshold) {
       const stock = getAllStocks().find((s) => s.ticker === rule.ticker);
       if (stock) {
-        const composite = computeComposite(stock, {
-          momentum: 30,
-          quality: 25,
-          lowVol: 20,
-          valuation: 10,
-          erm: 10,
-          insider: 5,
-        });
+        const composite = computeComposite(stock, { momentum: 30, quality: 25, lowVol: 20, valuation: 10, erm: 10, insider: 5 });
         if (composite >= rule.threshold)
-          alerts.push({
-            id: randomUUID(),
-            type: "score_above",
-            ticker: rule.ticker,
-            threshold: rule.threshold,
-            message: `${rule.ticker} composite score is ${composite} (threshold: ${rule.threshold})`,
-            createdAt: new Date().toISOString(),
-            read: false,
-          });
+          alerts.push({ id: randomUUID(), type: "score_above", ticker: rule.ticker, threshold: rule.threshold, message: `${rule.ticker} composite score is ${composite} (threshold: ${rule.threshold})`, createdAt: new Date().toISOString(), read: false });
       }
     }
     res.json(rule);

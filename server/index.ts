@@ -10,21 +10,22 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// Serve static frontend in production
-if (process.env.NODE_ENV === "production") {
-  const distPublic = path.join(__dirname, "../dist/public");
-  app.use(express.static(distPublic));
-  app.get("/*splat", (_req: any, res: any) => {
-    res.sendFile(path.join(distPublic, "index.html"));
-  });
-}
-
 const httpServer = createServer(app);
 
 // Boot sequence - all async work inside a single IIFE (CJS compatible)
 (async () => {
   try {
+    // Register API routes FIRST
     await registerRoutes(httpServer, app);
+
+    // Serve static frontend AFTER API routes (production only)
+    if (process.env.NODE_ENV === "production") {
+      const distPublic = path.join(__dirname, "../dist/public");
+      app.use(express.static(distPublic));
+      app.get("/*splat", (_req: any, res: any) => {
+        res.sendFile(path.join(distPublic, "index.html"));
+      });
+    }
 
     const PORT = parseInt(process.env.PORT || "5000", 10);
     httpServer.listen(PORT, "0.0.0.0", () => {
