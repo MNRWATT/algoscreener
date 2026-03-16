@@ -21,20 +21,20 @@ if (process.env.NODE_ENV === "production") {
 
 const httpServer = createServer(app);
 
-// Boot sequence — all async work inside a single IIFE (CJS compatible)
+// Boot sequence - all async work inside a single IIFE (CJS compatible)
 (async () => {
   try {
     await registerRoutes(httpServer, app);
 
     const PORT = parseInt(process.env.PORT || "5000", 10);
     httpServer.listen(PORT, "0.0.0.0", () => {
-      console.log(`[express] serving on port ${PORT}`);
+      console.log("[express] serving on port " + PORT);
     });
 
     // 1. Finnhub quote prewarm (non-blocking, top 50 tickers)
     prewarmCache();
 
-    // 2. Yahoo v8 chart prewarm — fetches price history AND stores chart meta
+    // 2. Yahoo chart prewarm - fetches price history AND stores chart meta
     console.log("[boot] Starting Yahoo price history + chart meta prewarm...");
     await prewarmHistoryCache();
 
