@@ -2,10 +2,17 @@
  * fundamentalsCache.ts
  *
  * Fetches real fundamental data from Financial Modeling Prep (FMP) free tier.
- * Caches results in memory and refreshes every 24 hours.
+ *
+ * FREE TIER endpoints used (no /stock-screener — that requires paid plan):
+ *   GET /api/v3/profile/{ticker}          → name, sector, exchange, marketCap, beta, price
+ *   GET /api/v3/ratios-ttm/{ticker}       → PE, PB, ROE, margins, D/E, div yield, growth
+ *
+ * We iterate over our known ~250 tickers in batches of 5 with 300ms between
+ * batches. Total API calls ≈ 500, split over two nights if on 250/day limit.
+ * On the free "Developer" key the limit is actually 250 calls/day total, so
+ * we cap to 120 tickers (~240 calls) which covers the most important names.
  *
  * To enable: set FMP_API_KEY environment variable in Render.
- * Sign up free at https://financialmodelingprep.com
  */
 
 declare const fetch: (input: any, init?: any) => Promise<any>;
@@ -13,6 +20,10 @@ declare const fetch: (input: any, init?: any) => Promise<any>;
 const FMP_BASE = "https://financialmodelingprep.com/api/v3";
 const FMP_API_KEY = process.env.FMP_API_KEY;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Max tickers to enrich per boot (2 calls each = 2 × MAX_TICKERS API calls).
+// Free tier = 250 calls/day → safe cap is 120 tickers (240 calls).
+const MAX_TICKERS = 120;
 
 export interface FundamentalsScore {
   ticker: string;
@@ -49,20 +60,20 @@ const state: CacheState = {
   status: "empty",
 };
 
-// ─── FMP API helper ─────────────────────────────────────────────
+// ─── FMP helper ───────────────────────────────────────────────────
 
-async function fmpGet(path: string, params: Record<string, string> = {}): Promise<any> {
+async function fmpGet(path: string): Promise<any> {
   if (!FMP_API_KEY) return null;
-  const qs = new URLSearchParams({ ...params, apikey: FMP_API_KEY }).toString();
-  const url = `${FMP_BASE}${path}?${qs}`;
+  const url = `${FMP_BASE}${path}?apikey=${FMP_API_KEY}`;
   try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      console.warn(`[fmp] HTTP ${res.status} for ${path}`);
+    const res = await fetch(url, {
+      headers: { "User-Agent": "AlgoScreener/1.0", Accept: "application/json" },
+    });
+    if (!res || !res.ok) {
+      console.warn(`[fmp] HTTP ${res?.status} for ${path}`);
       return null;
     }
     const json = await res.json();
-    // FMP returns {"Error Message": "..."} on bad key / plan limit
     if (json && typeof json === "object" && !Array.isArray(json) && json["Error Message"]) {
       console.warn(`[fmp] API error for ${path}:`, json["Error Message"]);
       return null;
@@ -74,7 +85,7 @@ async function fmpGet(path: string, params: Record<string, string> = {}): Promis
   }
 }
 
-// ─── Score normalization ────────────────────────────────────────
+// ─── Score normalization ──────────────────────────────────────────
 
 function clamp(v: number, min = 0, max = 100) {
   return Math.max(min, Math.min(max, v));
@@ -88,181 +99,145 @@ function percentileScore(value: number, allValues: number[], higherIsBetter = tr
   return clamp(Math.round(higherIsBetter ? score : 100 - score));
 }
 
-// ─── Main fetch + score pipeline ─────────────────────────────────
+function weightedScore(parts: { s: number; w: number }[]): number | null {
+  if (parts.length === 0) return null;
+  const wSum = parts.reduce((a, b) => a + b.w, 0);
+  if (wSum === 0) return null;
+  return clamp(Math.round(parts.reduce((a, b) => a + b.s * b.w, 0) / wSum));
+}
 
-async function buildFundamentalsCache(): Promise<void> {
+// ─── Main pipeline ────────────────────────────────────────────────
+
+async function buildFundamentalsCache(
+  tickers: string[]
+): Promise<void> {
   if (!FMP_API_KEY) {
-    console.warn("[fmp] FMP_API_KEY not set — real fundamentals disabled. Using seeded scores.");
+    console.warn("[fmp] FMP_API_KEY not set — real fundamentals disabled.");
     state.status = "error";
     return;
   }
 
-  console.log("[fmp] Starting fundamentals fetch...");
+  console.log(`[fmp] Starting fundamentals fetch for ${tickers.length} tickers...`);
   state.status = "loading";
 
-  // Step 1: Fetch screener for NYSE and NASDAQ separately to avoid comma-param issues
-  // then merge. Each call returns up to 1000 rows.
-  const [nyseData, nasdaqData] = await Promise.all([
-    fmpGet("/stock-screener", {
-      marketCapMoreThan: "500000000",
-      exchange: "NYSE",
-      limit: "1000",
-    }),
-    fmpGet("/stock-screener", {
-      marketCapMoreThan: "500000000",
-      exchange: "NASDAQ",
-      limit: "1000",
-    }),
-  ]);
-
-  const screenerRows: any[] = [
-    ...(Array.isArray(nyseData) ? nyseData : []),
-    ...(Array.isArray(nasdaqData) ? nasdaqData : []),
-  ];
-
-  if (screenerRows.length === 0) {
-    console.warn("[fmp] Screener returned no data for NYSE or NASDAQ");
-    state.status = "error";
-    return;
-  }
-
-  console.log(`[fmp] Screener returned ${screenerRows.length} companies (NYSE + NASDAQ)`);
-
-  // Step 2: Build initial map
   const tempMap = new Map<string, FundamentalsScore>();
-  for (const row of screenerRows) {
-    if (!row.symbol) continue;
-    // Deduplicate (symbol may appear in both exchanges occasionally)
-    if (tempMap.has(row.symbol)) continue;
-    tempMap.set(row.symbol, {
-      ticker: row.symbol,
-      name: row.companyName ?? row.symbol,
-      sector: row.sector ?? "Unknown",
-      exchange: row.exchangeShortName ?? "NYSE",
-      marketCap: typeof row.marketCap === "number" ? row.marketCap : null,
-      pe:
-        typeof row.price === "number" && typeof row.eps === "number" && row.eps > 0
-          ? Math.round((row.price / row.eps) * 10) / 10
-          : null,
-      pb: null,
-      roe: null,
-      profitMargin: typeof row.netProfitMargin === "number" ? Math.round(row.netProfitMargin * 1000) / 10 : null,
-      revenueGrowth: null,
-      epsGrowth: null,
-      beta: typeof row.beta === "number" ? row.beta : null,
-      dividendYield:
-        typeof row.lastAnnualDividend === "number" && typeof row.price === "number" && row.price > 0
-          ? Math.round((row.lastAnnualDividend / row.price) * 1000) / 10
-          : null,
-      debtToEquity: null,
-      momentumScore: null,
-      qualityScore: null,
-      lowVolScore: null,
-      valuationScore: null,
-      ermScore: null,
-      insiderScore: null,
+
+  // Initialise map with empty entries so we have something even if API fails
+  for (const ticker of tickers) {
+    tempMap.set(ticker, {
+      ticker, name: ticker, sector: "Unknown", exchange: "NYSE",
+      marketCap: null, pe: null, pb: null, roe: null, profitMargin: null,
+      revenueGrowth: null, epsGrowth: null, beta: null, dividendYield: null,
+      debtToEquity: null, momentumScore: null, qualityScore: null,
+      lowVolScore: null, valuationScore: null, ermScore: null, insiderScore: null,
     });
   }
 
-  // Step 3: Fetch key-metrics-ttm for top 200 by market cap
-  const topTickers = Array.from(tempMap.values())
-    .filter((s) => s.marketCap !== null)
-    .sort((a, b) => (b.marketCap ?? 0) - (a.marketCap ?? 0))
-    .slice(0, 200)
-    .map((s) => s.ticker);
+  const BATCH = 5;
+  const DELAY = 350; // ms between batches
+  let profileOk = 0;
+  let ratiosOk = 0;
 
-  const BATCH_SIZE = 5;
-  const BATCH_DELAY_MS = 300;
-  let fetched = 0;
-
-  for (let i = 0; i < topTickers.length; i += BATCH_SIZE) {
-    const batch = topTickers.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < tickers.length; i += BATCH) {
+    const batch = tickers.slice(i, i + BATCH);
     await Promise.all(
       batch.map(async (ticker) => {
-        const data = await fmpGet(`/key-metrics-ttm/${ticker}`);
-        if (!data || !Array.isArray(data) || data.length === 0) return;
-        const m = data[0];
-        const entry = tempMap.get(ticker);
-        if (!entry) return;
-        if (typeof m.roeTTM === "number") entry.roe = Math.round(m.roeTTM * 1000) / 10;
-        if (typeof m.pbRatioTTM === "number") entry.pb = Math.round(m.pbRatioTTM * 10) / 10;
-        if (typeof m.peRatioTTM === "number") entry.pe = Math.round(m.peRatioTTM * 10) / 10;
-        if (typeof m.netProfitMarginTTM === "number") entry.profitMargin = Math.round(m.netProfitMarginTTM * 1000) / 10;
-        if (typeof m.revenueGrowthTTM === "number") entry.revenueGrowth = Math.round(m.revenueGrowthTTM * 1000) / 10;
-        if (typeof m.epsgrowthTTM === "number") entry.epsGrowth = Math.round(m.epsgrowthTTM * 1000) / 10;
-        if (typeof m.debtToEquityTTM === "number") entry.debtToEquity = Math.round(m.debtToEquityTTM * 100) / 100;
-        if (typeof m.dividendYieldTTM === "number") entry.dividendYield = Math.round(m.dividendYieldTTM * 10000) / 100;
-        fetched++;
+        const entry = tempMap.get(ticker)!;
+
+        // ── /profile/{ticker} ──────────────────────────────────────
+        const profileData = await fmpGet(`/profile/${ticker}`);
+        if (Array.isArray(profileData) && profileData.length > 0) {
+          const p = profileData[0];
+          if (p.companyName) entry.name = p.companyName;
+          if (p.sector) entry.sector = p.sector;
+          if (p.exchangeShortName) entry.exchange = p.exchangeShortName;
+          if (typeof p.mktCap === "number") entry.marketCap = p.mktCap;
+          if (typeof p.beta === "number") entry.beta = p.beta;
+          profileOk++;
+        }
+
+        // ── /ratios-ttm/{ticker} ───────────────────────────────────
+        const ratioData = await fmpGet(`/ratios-ttm/${ticker}`);
+        if (Array.isArray(ratioData) && ratioData.length > 0) {
+          const r = ratioData[0];
+          // PE — use positive values only
+          if (typeof r.peRatioTTM === "number" && r.peRatioTTM > 0)
+            entry.pe = Math.round(r.peRatioTTM * 10) / 10;
+          if (typeof r.priceToBookRatioTTM === "number" && r.priceToBookRatioTTM > 0)
+            entry.pb = Math.round(r.priceToBookRatioTTM * 10) / 10;
+          // ROE comes as a decimal (e.g. 0.25 = 25%)
+          if (typeof r.returnOnEquityTTM === "number")
+            entry.roe = Math.round(r.returnOnEquityTTM * 1000) / 10;
+          if (typeof r.netProfitMarginTTM === "number")
+            entry.profitMargin = Math.round(r.netProfitMarginTTM * 1000) / 10;
+          if (typeof r.revenueGrowthTTM === "number")
+            entry.revenueGrowth = Math.round(r.revenueGrowthTTM * 1000) / 10;
+          if (typeof r.epsGrowthTTM === "number")
+            entry.epsGrowth = Math.round(r.epsGrowthTTM * 1000) / 10;
+          if (typeof r.debtEquityRatioTTM === "number")
+            entry.debtToEquity = Math.round(r.debtEquityRatioTTM * 100) / 100;
+          if (typeof r.dividendYieldTTM === "number")
+            entry.dividendYield = Math.round(r.dividendYieldTTM * 10000) / 100;
+          ratiosOk++;
+        }
       })
     );
-    if (i + BATCH_SIZE < topTickers.length) {
-      await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
+    if (i + BATCH < tickers.length) {
+      await new Promise((r) => setTimeout(r, DELAY));
     }
   }
 
-  console.log(`[fmp] Fetched key metrics for ${fetched} / ${topTickers.length} tickers`);
+  console.log(`[fmp] profiles: ${profileOk}/${tickers.length}, ratios: ${ratiosOk}/${tickers.length}`);
 
-  // Step 4: Percentile-rank factor scores across the full universe
+  // ── Percentile-rank scores across universe ───────────────────────
   const entries = Array.from(tempMap.values());
-
   const nums = (arr: (number | null)[]): number[] => arr.filter((v): v is number => v !== null);
 
-  const allROE = nums(entries.map((e) => e.roe));
-  const allMargin = nums(entries.map((e) => e.profitMargin));
-  const allDE = nums(entries.map((e) => e.debtToEquity));
-  const allBeta = nums(entries.map((e) => e.beta));
-  const allPE = nums(entries.map((e) => e.pe)).filter((v) => v > 0);
-  const allPB = nums(entries.map((e) => e.pb)).filter((v) => v > 0);
-  const allDY = nums(entries.map((e) => e.dividendYield));
+  const allROE      = nums(entries.map((e) => e.roe));
+  const allMargin   = nums(entries.map((e) => e.profitMargin));
+  const allDE       = nums(entries.map((e) => e.debtToEquity));
+  const allBeta     = nums(entries.map((e) => e.beta));
+  const allPE       = nums(entries.map((e) => e.pe)).filter((v) => v > 0);
+  const allPB       = nums(entries.map((e) => e.pb)).filter((v) => v > 0);
+  const allDY       = nums(entries.map((e) => e.dividendYield));
   const allRevGrowth = nums(entries.map((e) => e.revenueGrowth));
   const allEPSGrowth = nums(entries.map((e) => e.epsGrowth));
 
-  for (const entry of entries) {
+  for (const e of entries) {
     // Quality: ROE 40% + margin 35% + low D/E 25%
     const qParts: { s: number; w: number }[] = [];
-    if (entry.roe !== null) qParts.push({ s: percentileScore(entry.roe, allROE, true), w: 0.4 });
-    if (entry.profitMargin !== null) qParts.push({ s: percentileScore(entry.profitMargin, allMargin, true), w: 0.35 });
-    if (entry.debtToEquity !== null) qParts.push({ s: percentileScore(entry.debtToEquity, allDE, false), w: 0.25 });
-    if (qParts.length > 0) {
-      const wSum = qParts.reduce((a, b) => a + b.w, 0);
-      entry.qualityScore = clamp(Math.round(qParts.reduce((a, b) => a + b.s * b.w, 0) / wSum));
-    }
+    if (e.roe !== null)          qParts.push({ s: percentileScore(e.roe, allROE, true), w: 0.4 });
+    if (e.profitMargin !== null) qParts.push({ s: percentileScore(e.profitMargin, allMargin, true), w: 0.35 });
+    if (e.debtToEquity !== null) qParts.push({ s: percentileScore(e.debtToEquity, allDE, false), w: 0.25 });
+    e.qualityScore = weightedScore(qParts);
 
-    // Low Vol: inverse beta 100% (52W vol added when Yahoo history available)
-    if (entry.beta !== null) {
-      entry.lowVolScore = clamp(percentileScore(entry.beta, allBeta, false));
-    }
+    // Low Vol: inverse beta (52W vol blended in by stockData once Yahoo history ready)
+    if (e.beta !== null)
+      e.lowVolScore = clamp(percentileScore(e.beta, allBeta, false));
 
     // Valuation: inverse PE 40% + inverse PB 35% + div yield 25%
     const vParts: { s: number; w: number }[] = [];
-    if (entry.pe !== null && entry.pe > 0) vParts.push({ s: percentileScore(entry.pe, allPE, false), w: 0.4 });
-    if (entry.pb !== null && entry.pb > 0) vParts.push({ s: percentileScore(entry.pb, allPB, false), w: 0.35 });
-    if (entry.dividendYield !== null) vParts.push({ s: percentileScore(entry.dividendYield, allDY, true), w: 0.25 });
-    if (vParts.length > 0) {
-      const wSum = vParts.reduce((a, b) => a + b.w, 0);
-      entry.valuationScore = clamp(Math.round(vParts.reduce((a, b) => a + b.s * b.w, 0) / wSum));
-    }
+    if (e.pe !== null && e.pe > 0) vParts.push({ s: percentileScore(e.pe, allPE, false), w: 0.4 });
+    if (e.pb !== null && e.pb > 0) vParts.push({ s: percentileScore(e.pb, allPB, false), w: 0.35 });
+    if (e.dividendYield !== null)  vParts.push({ s: percentileScore(e.dividendYield, allDY, true), w: 0.25 });
+    e.valuationScore = weightedScore(vParts);
 
     // ERM: EPS growth 55% + revenue growth 45%
     const eParts: { s: number; w: number }[] = [];
-    if (entry.epsGrowth !== null) eParts.push({ s: percentileScore(entry.epsGrowth, allEPSGrowth, true), w: 0.55 });
-    if (entry.revenueGrowth !== null) eParts.push({ s: percentileScore(entry.revenueGrowth, allRevGrowth, true), w: 0.45 });
-    if (eParts.length > 0) {
-      const wSum = eParts.reduce((a, b) => a + b.w, 0);
-      entry.ermScore = clamp(Math.round(eParts.reduce((a, b) => a + b.s * b.w, 0) / wSum));
-    }
+    if (e.epsGrowth !== null)     eParts.push({ s: percentileScore(e.epsGrowth, allEPSGrowth, true), w: 0.55 });
+    if (e.revenueGrowth !== null) eParts.push({ s: percentileScore(e.revenueGrowth, allRevGrowth, true), w: 0.45 });
+    e.ermScore = weightedScore(eParts);
 
-    // Momentum: derived from Yahoo price history in stockData.ts — leave null here
-    // Insider: not on FMP free tier — leave null
+    // Momentum + Insider: derived elsewhere, leave null
   }
 
   state.data = tempMap;
   state.lastFetched = Date.now();
   state.status = "ready";
-  console.log(`[fmp] Fundamentals cache ready: ${tempMap.size} stocks scored`);
+  console.log(`[fmp] Fundamentals cache ready: ${tempMap.size} tickers scored`);
 }
 
-// ─── Public API ──────────────────────────────────────────────────
+// ─── Public API ───────────────────────────────────────────────────
 
 export function getFundamentals(ticker: string): FundamentalsScore | null {
   return state.data.get(ticker) ?? null;
@@ -281,11 +256,25 @@ export function getCacheStatus() {
   };
 }
 
-export async function initFundamentalsCache(): Promise<void> {
-  await buildFundamentalsCache();
-  setInterval(() => {
-    buildFundamentalsCache().catch((err) =>
-      console.warn("[fmp] Daily refresh failed (non-fatal):", err)
-    );
-  }, CACHE_TTL_MS);
+/**
+ * Called on server startup. Passes the top MAX_TICKERS tickers (by position
+ * in our universe list, which is roughly market-cap ordered) to the pipeline.
+ * Refreshes every 24 hours.
+ */
+export async function initFundamentalsCache(
+  tickers?: string[]
+): Promise<void> {
+  // Lazy-import getAllStocks to avoid circular dep at module load time
+  const { getAllStocks } = await import("./stockData");
+  const allTickers = (tickers ?? getAllStocks().map((s) => s.ticker)).slice(0, MAX_TICKERS);
+
+  await buildFundamentalsCache(allTickers);
+
+  setInterval(
+    () =>
+      buildFundamentalsCache(allTickers).catch((err) =>
+        console.warn("[fmp] Daily refresh failed (non-fatal):", err)
+      ),
+    CACHE_TTL_MS
+  );
 }
