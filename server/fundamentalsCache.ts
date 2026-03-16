@@ -1,29 +1,30 @@
 /**
  * fundamentalsCache.ts
  *
- * Fetches real fundamental data from Financial Modeling Prep (FMP) free tier.
+ * Fetches real fundamental data from Yahoo Finance (free, no API key).
+ * Uses the unofficial quoteSummary v10 endpoint — same host we use for
+ * price history, so no new dependencies or environment variables.
  *
- * FREE TIER endpoints used (no /stock-screener — that requires paid plan):
- *   GET /api/v3/profile/{ticker}          → name, sector, exchange, marketCap, beta, price
- *   GET /api/v3/ratios-ttm/{ticker}       → PE, PB, ROE, margins, D/E, div yield, growth
+ * Modules fetched per ticker (single request):
+ *   defaultKeyStatistics → beta, trailingPE, priceToBook, earningsQuarterlyGrowth
+ *   financialData        → returnOnEquity, profitMargins, revenueGrowth, debtToEquity
+ *   summaryDetail        → marketCap, dividendYield, trailingPE (fallback)
+ *   assetProfile         → sector, industry
  *
- * We iterate over our known ~250 tickers in batches of 5 with 300ms between
- * batches. Total API calls ≈ 500, split over two nights if on 250/day limit.
- * On the free "Developer" key the limit is actually 250 calls/day total, so
- * we cap to 120 tickers (~240 calls) which covers the most important names.
- *
- * To enable: set FMP_API_KEY environment variable in Render.
+ * No API key required. No daily call limit.
+ * All ~250 tickers fetched at boot with 300ms stagger (≈75s total).
  */
 
 declare const fetch: (input: any, init?: any) => Promise<any>;
 
-const FMP_BASE = "https://financialmodelingprep.com/api/v3";
-const FMP_API_KEY = process.env.FMP_API_KEY;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-// Max tickers to enrich per boot (2 calls each = 2 × MAX_TICKERS API calls).
-// Free tier = 250 calls/day → safe cap is 120 tickers (240 calls).
-const MAX_TICKERS = 120;
+const YAHOO_MODULES = [
+  "defaultKeyStatistics",
+  "financialData",
+  "summaryDetail",
+  "assetProfile",
+].join("%2C");
 
 export interface FundamentalsScore {
   ticker: string;
@@ -60,27 +61,93 @@ const state: CacheState = {
   status: "empty",
 };
 
-// ─── FMP helper ───────────────────────────────────────────────────
+// ─── Yahoo quoteSummary fetch ────────────────────────────────────────
 
-async function fmpGet(path: string): Promise<any> {
-  if (!FMP_API_KEY) return null;
-  const url = `${FMP_BASE}${path}?apikey=${FMP_API_KEY}`;
+function num(val: any): number | null {
+  if (val && typeof val === "object" && "raw" in val) val = val.raw;
+  return typeof val === "number" && isFinite(val) ? val : null;
+}
+
+async function fetchYahooFundamentals(ticker: string): Promise<FundamentalsScore | null> {
+  const symbol = ticker.replace(".", "-");
+  const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${YAHOO_MODULES}`;
   try {
     const res = await fetch(url, {
-      headers: { "User-Agent": "AlgoScreener/1.0", Accept: "application/json" },
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; AlgoScreener/1.0)",
+        Accept: "application/json",
+      },
     });
     if (!res || !res.ok) {
-      console.warn(`[fmp] HTTP ${res?.status} for ${path}`);
+      console.warn(`[yahoo-fund] HTTP ${res?.status} for ${ticker}`);
       return null;
     }
-    const json = await res.json();
-    if (json && typeof json === "object" && !Array.isArray(json) && json["Error Message"]) {
-      console.warn(`[fmp] API error for ${path}:`, json["Error Message"]);
+    const json = await res.json() as any;
+    const result = json?.quoteSummary?.result?.[0];
+    if (!result) {
+      console.warn(`[yahoo-fund] no result for ${ticker}`);
       return null;
     }
-    return json;
+
+    const ks  = result.defaultKeyStatistics ?? {};
+    const fd  = result.financialData ?? {};
+    const sd  = result.summaryDetail ?? {};
+    const ap  = result.assetProfile ?? {};
+
+    // P/E: prefer trailingPE from summaryDetail (more reliable), fallback to keyStats
+    const pe = num(sd.trailingPE) ?? num(ks.trailingPE);
+    // P/B
+    const pb = num(ks.priceToBook);
+    // ROE comes as decimal e.g. 0.25 → convert to %
+    const roeRaw = num(fd.returnOnEquity);
+    const roe = roeRaw !== null ? Math.round(roeRaw * 1000) / 10 : null;
+    // Profit margin: decimal → %
+    const marginRaw = num(fd.profitMargins);
+    const profitMargin = marginRaw !== null ? Math.round(marginRaw * 1000) / 10 : null;
+    // Revenue growth: decimal → %
+    const revRaw = num(fd.revenueGrowth);
+    const revenueGrowth = revRaw !== null ? Math.round(revRaw * 1000) / 10 : null;
+    // EPS growth (quarterly YoY): decimal → %
+    const epsRaw = num(ks.earningsQuarterlyGrowth);
+    const epsGrowth = epsRaw !== null ? Math.round(epsRaw * 1000) / 10 : null;
+    // D/E ratio
+    const deRaw = num(fd.debtToEquity);
+    // Yahoo returns D/E as e.g. 150 (meaning 1.5x) — normalise to same scale as FMP (0–10 range)
+    const debtToEquity = deRaw !== null ? Math.round((deRaw / 100) * 100) / 100 : null;
+    // Dividend yield: decimal → %
+    const dyRaw = num(sd.dividendYield) ?? num(sd.trailingAnnualDividendYield);
+    const dividendYield = dyRaw !== null ? Math.round(dyRaw * 10000) / 100 : null;
+    // Beta
+    const beta = num(ks.beta) ?? num(sd.beta);
+    // Market cap (raw number, in dollars)
+    const marketCap = num(sd.marketCap);
+    // Sector
+    const sector = typeof ap.sector === "string" ? ap.sector : "Unknown";
+
+    return {
+      ticker,
+      name: ticker, // name comes from stockData, not needed here
+      sector,
+      exchange: "NYSE", // exchange comes from stockData too
+      marketCap,
+      pe: pe !== null && pe > 0 ? Math.round(pe * 10) / 10 : null,
+      pb: pb !== null && pb > 0 ? Math.round(pb * 10) / 10 : null,
+      roe,
+      profitMargin,
+      revenueGrowth,
+      epsGrowth,
+      beta,
+      dividendYield,
+      debtToEquity,
+      momentumScore: null,
+      qualityScore: null,
+      lowVolScore: null,
+      valuationScore: null,
+      ermScore: null,
+      insiderScore: null,
+    };
   } catch (err) {
-    console.warn(`[fmp] fetch failed for ${path}:`, err);
+    console.warn(`[yahoo-fund] fetch failed for ${ticker}:`, err);
     return null;
   }
 }
@@ -108,77 +175,27 @@ function weightedScore(parts: { s: number; w: number }[]): number | null {
 
 // ─── Main pipeline ────────────────────────────────────────────────
 
-async function buildFundamentalsCache(
-  tickers: string[]
-): Promise<void> {
-  if (!FMP_API_KEY) {
-    console.warn("[fmp] FMP_API_KEY not set — real fundamentals disabled.");
-    state.status = "error";
-    return;
-  }
-
-  console.log(`[fmp] Starting fundamentals fetch for ${tickers.length} tickers...`);
+async function buildFundamentalsCache(tickers: string[]): Promise<void> {
+  console.log(`[yahoo-fund] Starting fundamentals fetch for ${tickers.length} tickers...`);
   state.status = "loading";
 
   const tempMap = new Map<string, FundamentalsScore>();
-
-  // Initialise map with empty entries so we have something even if API fails
-  for (const ticker of tickers) {
-    tempMap.set(ticker, {
-      ticker, name: ticker, sector: "Unknown", exchange: "NYSE",
-      marketCap: null, pe: null, pb: null, roe: null, profitMargin: null,
-      revenueGrowth: null, epsGrowth: null, beta: null, dividendYield: null,
-      debtToEquity: null, momentumScore: null, qualityScore: null,
-      lowVolScore: null, valuationScore: null, ermScore: null, insiderScore: null,
-    });
-  }
+  let success = 0;
+  let failed = 0;
 
   const BATCH = 5;
-  const DELAY = 350; // ms between batches
-  let profileOk = 0;
-  let ratiosOk = 0;
+  const DELAY = 300;
 
   for (let i = 0; i < tickers.length; i += BATCH) {
     const batch = tickers.slice(i, i + BATCH);
     await Promise.all(
       batch.map(async (ticker) => {
-        const entry = tempMap.get(ticker)!;
-
-        // ── /profile/{ticker} ──────────────────────────────────────
-        const profileData = await fmpGet(`/profile/${ticker}`);
-        if (Array.isArray(profileData) && profileData.length > 0) {
-          const p = profileData[0];
-          if (p.companyName) entry.name = p.companyName;
-          if (p.sector) entry.sector = p.sector;
-          if (p.exchangeShortName) entry.exchange = p.exchangeShortName;
-          if (typeof p.mktCap === "number") entry.marketCap = p.mktCap;
-          if (typeof p.beta === "number") entry.beta = p.beta;
-          profileOk++;
-        }
-
-        // ── /ratios-ttm/{ticker} ───────────────────────────────────
-        const ratioData = await fmpGet(`/ratios-ttm/${ticker}`);
-        if (Array.isArray(ratioData) && ratioData.length > 0) {
-          const r = ratioData[0];
-          // PE — use positive values only
-          if (typeof r.peRatioTTM === "number" && r.peRatioTTM > 0)
-            entry.pe = Math.round(r.peRatioTTM * 10) / 10;
-          if (typeof r.priceToBookRatioTTM === "number" && r.priceToBookRatioTTM > 0)
-            entry.pb = Math.round(r.priceToBookRatioTTM * 10) / 10;
-          // ROE comes as a decimal (e.g. 0.25 = 25%)
-          if (typeof r.returnOnEquityTTM === "number")
-            entry.roe = Math.round(r.returnOnEquityTTM * 1000) / 10;
-          if (typeof r.netProfitMarginTTM === "number")
-            entry.profitMargin = Math.round(r.netProfitMarginTTM * 1000) / 10;
-          if (typeof r.revenueGrowthTTM === "number")
-            entry.revenueGrowth = Math.round(r.revenueGrowthTTM * 1000) / 10;
-          if (typeof r.epsGrowthTTM === "number")
-            entry.epsGrowth = Math.round(r.epsGrowthTTM * 1000) / 10;
-          if (typeof r.debtEquityRatioTTM === "number")
-            entry.debtToEquity = Math.round(r.debtEquityRatioTTM * 100) / 100;
-          if (typeof r.dividendYieldTTM === "number")
-            entry.dividendYield = Math.round(r.dividendYieldTTM * 10000) / 100;
-          ratiosOk++;
+        const entry = await fetchYahooFundamentals(ticker);
+        if (entry) {
+          tempMap.set(ticker, entry);
+          success++;
+        } else {
+          failed++;
         }
       })
     );
@@ -187,21 +204,27 @@ async function buildFundamentalsCache(
     }
   }
 
-  console.log(`[fmp] profiles: ${profileOk}/${tickers.length}, ratios: ${ratiosOk}/${tickers.length}`);
+  console.log(`[yahoo-fund] Fetched: ${success} ok, ${failed} failed`);
 
-  // ── Percentile-rank scores across universe ───────────────────────
+  if (success === 0) {
+    console.warn("[yahoo-fund] All fetches failed — keeping seeded fallbacks");
+    state.status = "error";
+    return;
+  }
+
+  // ── Percentile-rank factor scores across the fetched universe ────────
   const entries = Array.from(tempMap.values());
-  const nums = (arr: (number | null)[]): number[] => arr.filter((v): v is number => v !== null);
+  const nums2 = (arr: (number | null)[]): number[] => arr.filter((v): v is number => v !== null);
 
-  const allROE      = nums(entries.map((e) => e.roe));
-  const allMargin   = nums(entries.map((e) => e.profitMargin));
-  const allDE       = nums(entries.map((e) => e.debtToEquity));
-  const allBeta     = nums(entries.map((e) => e.beta));
-  const allPE       = nums(entries.map((e) => e.pe)).filter((v) => v > 0);
-  const allPB       = nums(entries.map((e) => e.pb)).filter((v) => v > 0);
-  const allDY       = nums(entries.map((e) => e.dividendYield));
-  const allRevGrowth = nums(entries.map((e) => e.revenueGrowth));
-  const allEPSGrowth = nums(entries.map((e) => e.epsGrowth));
+  const allROE       = nums2(entries.map((e) => e.roe));
+  const allMargin    = nums2(entries.map((e) => e.profitMargin));
+  const allDE        = nums2(entries.map((e) => e.debtToEquity));
+  const allBeta      = nums2(entries.map((e) => e.beta));
+  const allPE        = nums2(entries.map((e) => e.pe)).filter((v) => v > 0);
+  const allPB        = nums2(entries.map((e) => e.pb)).filter((v) => v > 0);
+  const allDY        = nums2(entries.map((e) => e.dividendYield));
+  const allRevGrowth = nums2(entries.map((e) => e.revenueGrowth));
+  const allEPSGrowth = nums2(entries.map((e) => e.epsGrowth));
 
   for (const e of entries) {
     // Quality: ROE 40% + margin 35% + low D/E 25%
@@ -211,7 +234,7 @@ async function buildFundamentalsCache(
     if (e.debtToEquity !== null) qParts.push({ s: percentileScore(e.debtToEquity, allDE, false), w: 0.25 });
     e.qualityScore = weightedScore(qParts);
 
-    // Low Vol: inverse beta (52W vol blended in by stockData once Yahoo history ready)
+    // Low Vol: inverse beta (Yahoo beta = same 5Y monthly beta as most providers)
     if (e.beta !== null)
       e.lowVolScore = clamp(percentileScore(e.beta, allBeta, false));
 
@@ -234,7 +257,7 @@ async function buildFundamentalsCache(
   state.data = tempMap;
   state.lastFetched = Date.now();
   state.status = "ready";
-  console.log(`[fmp] Fundamentals cache ready: ${tempMap.size} tickers scored`);
+  console.log(`[yahoo-fund] Fundamentals cache ready: ${tempMap.size} tickers scored`);
 }
 
 // ─── Public API ───────────────────────────────────────────────────
@@ -252,28 +275,24 @@ export function getCacheStatus() {
     status: state.status,
     count: state.data.size,
     lastFetched: state.lastFetched,
-    fmpEnabled: !!FMP_API_KEY,
+    fmpEnabled: false, // no longer used
   };
 }
 
 /**
- * Called on server startup. Passes the top MAX_TICKERS tickers (by position
- * in our universe list, which is roughly market-cap ordered) to the pipeline.
+ * Called on server startup. Fetches Yahoo fundamentals for all tickers.
  * Refreshes every 24 hours.
  */
-export async function initFundamentalsCache(
-  tickers?: string[]
-): Promise<void> {
-  // Lazy-import getAllStocks to avoid circular dep at module load time
+export async function initFundamentalsCache(tickers?: string[]): Promise<void> {
   const { getAllStocks } = await import("./stockData");
-  const allTickers = (tickers ?? getAllStocks().map((s) => s.ticker)).slice(0, MAX_TICKERS);
+  const allTickers = tickers ?? getAllStocks().map((s) => s.ticker);
 
   await buildFundamentalsCache(allTickers);
 
   setInterval(
     () =>
       buildFundamentalsCache(allTickers).catch((err) =>
-        console.warn("[fmp] Daily refresh failed (non-fatal):", err)
+        console.warn("[yahoo-fund] Daily refresh failed (non-fatal):", err)
       ),
     CACHE_TTL_MS
   );
