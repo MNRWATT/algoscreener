@@ -1,5 +1,5 @@
 import { getAllStocks } from "./stockData";
-import { getFundamentals } from "./fundamentalsCache";
+import { getFundamentals, storeChartMeta } from "./fundamentalsCache";
 import type { PricePoint } from "@shared/schema";
 
 export interface LiveQuote {
@@ -26,12 +26,11 @@ const QUOTE_CACHE_TTL = 15 * 60 * 1000;
 const historyCache = new Map<string, { data: PricePoint[]; ts: number }>();
 const HISTORY_CACHE_TTL = 24 * 60 * 60 * 1000;
 
-// Derived momentum/vol metrics computed from history, shared by screener + detail
 export interface HistoryMetrics {
   return12m: number | null;
   return6m: number | null;
   return3m: number | null;
-  volatility52w: number | null; // annualised % std dev of daily returns
+  volatility52w: number | null;
 }
 
 const metricsCache = new Map<string, HistoryMetrics>();
@@ -76,15 +75,20 @@ export async function getCachedQuote(ticker: string): Promise<LiveQuote | null> 
   return data;
 }
 
-export async function getCachedQuotes(
-  tickers: string[],
-): Promise<Map<string, LiveQuote | null>> {
+export async function getCachedQuotes(tickers: string[]): Promise<Map<string, LiveQuote | null>> {
   const results = new Map<string, LiveQuote | null>();
   for (const t of tickers) results.set(t, await getCachedQuote(t));
   return results;
 }
 
-// ─── Daily price history via Yahoo Finance v8 (free, no key) ─────
+// ─── Daily price history via Yahoo Finance v8 ────────────────────
+// Also extracts fundamentals meta fields from the same response
+// so fundamentalsCache gets PE, PB, beta, marketCap, divYield, EPS
+// with ZERO extra API calls.
+
+function safeNum(val: any): number | null {
+  return typeof val === "number" && isFinite(val) ? val : null;
+}
 
 async function fetchYahooHistory(ticker: string): Promise<PricePoint[] | null> {
   const yahooSymbol = ticker.replace(".", "-");
@@ -100,6 +104,21 @@ async function fetchYahooHistory(ticker: string): Promise<PricePoint[] | null> {
     const json = (await res.json()) as any;
     const result = json?.chart?.result?.[0];
     if (!result) { console.warn(`[yahoo] no result for ${ticker}`); return null; }
+
+    // ── Extract meta fundamentals and pass to fundamentalsCache ──
+    const meta = result.meta ?? {};
+    storeChartMeta(ticker, {
+      pe:            safeNum(meta.trailingPE),
+      pb:            safeNum(meta.priceToBook),
+      beta:          safeNum(meta.beta),
+      marketCap:     safeNum(meta.marketCap),
+      eps:           safeNum(meta.epsTrailingTwelveMonths),
+      dividendYield: safeNum(meta.dividendYield),
+      bookValue:     safeNum(meta.bookValue),
+      sector:        typeof meta.sector === "string" ? meta.sector : null,
+    });
+
+    // ── Extract price history ─────────────────────────────────────
     const timestamps: number[] = result.timestamp ?? [];
     const closes: number[] = result.indicators?.quote?.[0]?.close ?? [];
     if (timestamps.length === 0 || closes.length === 0) { console.warn(`[yahoo] empty data for ${ticker}`); return null; }
@@ -126,18 +145,16 @@ export async function getPriceHistory24M(ticker: string): Promise<PricePoint[] |
   const data = await fetchYahooHistory(ticker);
   if (data && data.length > 0) {
     historyCache.set(ticker, { data, ts: now });
-    // Recompute metrics whenever history refreshes
     metricsCache.set(ticker, deriveMetrics(data));
     return data;
   }
   return null;
 }
 
-// ─── Derive momentum returns + 52W volatility from price history ───
+// ─── Derive momentum returns + 52W volatility ────────────────────
 
 function deriveMetrics(history: PricePoint[]): HistoryMetrics {
   if (history.length < 2) return { return12m: null, return6m: null, return3m: null, volatility52w: null };
-
   const closes = history.map((p) => p.price);
   const n = closes.length;
   const latest = closes[n - 1];
@@ -148,7 +165,6 @@ function deriveMetrics(history: PricePoint[]): HistoryMetrics {
     return Math.round(((latest - start) / start) * 10000) / 100;
   }
 
-  // 52W annualised volatility from last 252 trading days of daily returns
   const vol252 = closes.slice(Math.max(0, n - 253));
   let vol52w: number | null = null;
   if (vol252.length >= 10) {
@@ -159,24 +175,22 @@ function deriveMetrics(history: PricePoint[]): HistoryMetrics {
     if (dailyReturns.length >= 5) {
       const mean = dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length;
       const variance = dailyReturns.reduce((a, b) => a + (b - mean) ** 2, 0) / dailyReturns.length;
-      vol52w = Math.round(Math.sqrt(variance * 252) * 10000) / 100; // annualised %
+      vol52w = Math.round(Math.sqrt(variance * 252) * 10000) / 100;
     }
   }
 
   return {
     return12m: calcReturn(n - 252),
-    return6m: calcReturn(n - 126),
-    return3m: calcReturn(n - 63),
+    return6m:  calcReturn(n - 126),
+    return3m:  calcReturn(n - 63),
     volatility52w: vol52w,
   };
 }
 
-/** Returns pre-computed history metrics for a ticker, or null if not yet cached. */
 export function getHistoryMetrics(ticker: string): HistoryMetrics | null {
   return metricsCache.get(ticker) ?? null;
 }
 
-// Kept for backwards compat — routes.ts calls this for stock detail overlay
 export function computeReturnsFromHistory(history: PricePoint[]): {
   return12m: number | null;
   return6m: number | null;
@@ -186,11 +200,11 @@ export function computeReturnsFromHistory(history: PricePoint[]): {
   return { return12m: m.return12m, return6m: m.return6m, return3m: m.return3m };
 }
 
-// ─── Startup: pre-warm Yahoo history for entire universe ─────────
+// ─── Startup prewarms ────────────────────────────────────────────
 
 export async function prewarmHistoryCache(): Promise<void> {
   const tickers = getAllStocks().map((s) => s.ticker);
-  console.log(`[yahoo-prewarm] Fetching 24M history for ${tickers.length} tickers (staggered 350ms)...`);
+  console.log(`[yahoo-prewarm] Fetching 24M history + chart meta for ${tickers.length} tickers (staggered 350ms)...`);
   let success = 0;
   let failed = 0;
   for (const ticker of tickers) {
@@ -206,16 +220,12 @@ export async function prewarmHistoryCache(): Promise<void> {
     } catch {
       failed++;
     }
-    // 350ms between requests — polite to Yahoo, ~250 tickers ≈ 90s total
     await new Promise((r) => setTimeout(r, 350));
   }
   console.log(`[yahoo-prewarm] Complete: ${success} succeeded, ${failed} failed.`);
-
-  // Invalidate stock score cache so next screener request picks up real momentum
   invalidateStockCache();
 }
 
-// Callback registered by stockData to bust its cache after history is ready
 let _invalidateStockCache: (() => void) | null = null;
 export function registerStockCacheInvalidator(fn: () => void) {
   _invalidateStockCache = fn;
@@ -223,8 +233,6 @@ export function registerStockCacheInvalidator(fn: () => void) {
 function invalidateStockCache() {
   if (_invalidateStockCache) _invalidateStockCache();
 }
-
-// ─── Finnhub quote prewarm (unchanged) ────────────────────────
 
 export async function prewarmCache(): Promise<void> {
   const allTickers = getAllStocks().map((s) => s.ticker);

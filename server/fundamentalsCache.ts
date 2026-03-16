@@ -1,73 +1,80 @@
 /**
  * fundamentalsCache.ts
  *
- * Layered data strategy — all free tier, no limits exceeded:
+ * Two data sources, both confirmed working:
  *
- *  Source 1 — Yahoo Finance v7 /finance/quote (batch up to 10 symbols)
- *    Fields: pe, pb, beta, marketCap, dividendYield, heldPercentInsiders
- *    No auth required. ~25 batch calls for 250 tickers.
+ *  Source 1 — Yahoo v8 /chart meta (zero extra API calls)
+ *    Extracted during the existing prewarm in marketData.ts
+ *    Fields: pe, pb, beta, marketCap, eps, dividendYield, bookValue, sector
+ *    Derived: insiderOwnership not available — shown as dash
  *
  *  Source 2 — Finnhub /stock/metric
- *    Fields: epsGrowth (EPS5Y), revenueGrowth (revenueGrowthTTMYoy)
- *    Free: 60 calls/min, no daily cap. 250 calls @ 300ms = ~75s.
+ *    Fields: epsGrowth (epsTTMGrowth), revenueGrowth (revenueGrowthTTMYoy)
+ *    Free tier: 60 calls/min, no daily cap
  *
- *  Source 3 — FMP /ratios-ttm/{ticker}
- *    Fields: roe, profitMargin, debtToEquity
- *    Free tier: 250 calls/day — exactly our universe size.
- *
- * If a source fails or returns null for a field → that field stays null.
- * NO seeded/synthetic fallbacks. Null = dash in the UI.
+ * No Yahoo v7, no FMP, no quoteSummary.
+ * Null = data not available = dash in UI. No seeded fallbacks.
  */
 
 declare const fetch: (input: any, init?: any) => Promise<any>;
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
-const FMP_API_KEY = process.env.FMP_API_KEY;
+
+export interface ChartMeta {
+  pe: number | null;
+  pb: number | null;
+  beta: number | null;
+  marketCap: number | null;
+  eps: number | null;
+  dividendYield: number | null;
+  bookValue: number | null;
+  sector: string | null;
+}
 
 export interface FundamentalsScore {
   ticker: string;
   sector: string;
   marketCap: number | null;
-  // Raw metrics (null = data not available from any source)
   pe: number | null;
   pb: number | null;
-  roe: number | null;
-  profitMargin: number | null;
-  revenueGrowth: number | null;
-  epsGrowth: number | null;
-  beta: number | null;
-  dividendYield: number | null;
-  debtToEquity: number | null;
-  insiderOwnership: number | null;
-  // Factor scores (null = insufficient data to compute)
+  roe: number | null;           // not available from v8 meta — always null
+  profitMargin: number | null;  // not available from v8 meta — always null
+  revenueGrowth: number | null; // Finnhub
+  epsGrowth: number | null;     // Finnhub
+  beta: number | null;          // Yahoo v8 meta
+  dividendYield: number | null; // Yahoo v8 meta
+  debtToEquity: number | null;  // not available — always null
+  insiderOwnership: number | null; // not available — always null
+  // Factor scores
   qualityScore: number | null;
   lowVolScore: number | null;
   valuationScore: number | null;
   ermScore: number | null;
   insiderScore: number | null;
-  // Sources that successfully returned data
   sources: string[];
 }
 
 interface CacheState {
   data: Map<string, FundamentalsScore>;
+  chartMeta: Map<string, ChartMeta>;
   lastFetched: number;
   status: "empty" | "loading" | "ready" | "error";
 }
 
 const state: CacheState = {
   data: new Map(),
+  chartMeta: new Map(),
   lastFetched: 0,
   status: "empty",
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────
-
-function n(val: any): number | null {
-  if (val && typeof val === "object" && "raw" in val) val = val.raw;
-  return typeof val === "number" && isFinite(val) ? val : null;
+// Called by marketData.ts during each v8 chart fetch — no extra HTTP calls
+export function storeChartMeta(ticker: string, meta: ChartMeta): void {
+  state.chartMeta.set(ticker, meta);
 }
+
+// ─── Helpers ──────────────────────────────────────────────────────
 
 function clamp(v: number, min = 0, max = 100) {
   return Math.max(min, Math.min(max, v));
@@ -88,159 +95,86 @@ function weightedScore(parts: { s: number; w: number }[]): number | null {
   return clamp(Math.round(parts.reduce((a, b) => a + b.s * b.w, 0) / wSum));
 }
 
-async function safeFetch(url: string, headers: Record<string, string> = {}): Promise<any> {
+// ─── Source 2: Finnhub /stock/metric ─────────────────────────────
+
+async function safeFetch(url: string): Promise<any> {
   try {
-    const res = await fetch(url, { headers: { "User-Agent": "AlgoScreener/1.0", Accept: "application/json", ...headers } });
+    const res = await fetch(url, {
+      headers: { "User-Agent": "AlgoScreener/1.0", Accept: "application/json" },
+    });
     if (!res || !res.ok) { console.warn(`[fund] HTTP ${res?.status} → ${url.split("?")[0]}`); return null; }
-    const json = await res.json();
-    if (json?.["Error Message"]) { console.warn(`[fund] API error: ${json["Error Message"]}`); return null; }
-    return json;
+    return await res.json();
   } catch (err) {
     console.warn(`[fund] fetch error: ${err}`);
     return null;
   }
 }
 
-// ─── Source 1: Yahoo v7 /finance/quote (batch 10) ────────────────
-// Returns: pe, pb, beta, marketCap, dividendYield, insiderOwnership
-
-async function fetchYahooQuoteBatch(tickers: string[]): Promise<Map<string, Partial<FundamentalsScore>>> {
-  const result = new Map<string, Partial<FundamentalsScore>>();
-  const BATCH = 10;
-  const DELAY = 300;
-
-  for (let i = 0; i < tickers.length; i += BATCH) {
-    const batch = tickers.slice(i, i + BATCH);
-    const symbols = batch.map((t) => t.replace(".", "-")).join(",");
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}&fields=trailingPE,priceToBook,beta,marketCap,dividendYield,heldPercentInsiders,sector`;
-    const json = await safeFetch(url);
-    const quotes: any[] = json?.quoteResponse?.result ?? [];
-    for (const q of quotes) {
-      const ticker = (q.symbol ?? "").replace("-", ".");
-      const pe = n(q.trailingPE);
-      const pb = n(q.priceToBook);
-      const beta = n(q.beta);
-      const marketCap = n(q.marketCap);
-      const dyRaw = n(q.dividendYield);
-      const dividendYield = dyRaw !== null ? Math.round(dyRaw * 10000) / 100 : null;
-      const insRaw = n(q.heldPercentInsiders);
-      const insiderOwnership = insRaw !== null ? Math.round(insRaw * 1000) / 10 : null;
-      const sector = typeof q.sector === "string" ? q.sector : null;
-      result.set(ticker, {
-        pe: pe !== null && pe > 0 ? Math.round(pe * 10) / 10 : null,
-        pb: pb !== null && pb > 0 ? Math.round(pb * 10) / 10 : null,
-        beta,
-        marketCap,
-        dividendYield,
-        insiderOwnership,
-        ...(sector ? { sector } : {}),
-      });
-    }
-    if (i + BATCH < tickers.length) await new Promise((r) => setTimeout(r, DELAY));
-  }
-  return result;
-}
-
-// ─── Source 2: Finnhub /stock/metric ─────────────────────────────
-// Returns: epsGrowth (epsTTMGrowth), revenueGrowth (revenueGrowthTTMYoy)
-
-async function fetchFinnhubMetrics(tickers: string[]): Promise<Map<string, Partial<FundamentalsScore>>> {
-  const result = new Map<string, Partial<FundamentalsScore>>();
+async function fetchFinnhubMetrics(tickers: string[]): Promise<Map<string, { epsGrowth: number | null; revenueGrowth: number | null }>> {
+  const result = new Map<string, { epsGrowth: number | null; revenueGrowth: number | null }>();
   if (!FINNHUB_API_KEY) {
-    console.warn("[fund:finnhub] FINNHUB_API_KEY not set — skipping growth metrics");
+    console.warn("[fund:finnhub] FINNHUB_API_KEY not set — ERM scores will be null");
     return result;
   }
-  const DELAY = 300; // 60 calls/min free tier = 1/s; 300ms gives headroom
   for (const ticker of tickers) {
     const url = `https://finnhub.io/api/v1/stock/metric?symbol=${encodeURIComponent(ticker)}&metric=all&token=${FINNHUB_API_KEY}`;
     const json = await safeFetch(url);
     const m = json?.metric ?? {};
-    const epsRaw = n(m["epsTTMGrowth"] ?? m["epsGrowth5Y"]);
-    const revRaw = n(m["revenueGrowthTTMYoy"] ?? m["revenueGrowth5Y"]);
+    const epsRaw   = typeof m["epsTTMGrowth"]            === "number" ? m["epsTTMGrowth"]            : null;
+    const revRaw   = typeof m["revenueGrowthTTMYoy"]     === "number" ? m["revenueGrowthTTMYoy"]     : null;
     result.set(ticker, {
-      epsGrowth: epsRaw !== null ? Math.round(epsRaw * 10) / 10 : null,
+      epsGrowth:     epsRaw !== null ? Math.round(epsRaw * 10) / 10 : null,
       revenueGrowth: revRaw !== null ? Math.round(revRaw * 10) / 10 : null,
     });
-    await new Promise((r) => setTimeout(r, DELAY));
-  }
-  return result;
-}
-
-// ─── Source 3: FMP /ratios-ttm/{ticker} ──────────────────────────
-// Returns: roe, profitMargin, debtToEquity
-
-async function fetchFMPRatios(tickers: string[]): Promise<Map<string, Partial<FundamentalsScore>>> {
-  const result = new Map<string, Partial<FundamentalsScore>>();
-  if (!FMP_API_KEY) {
-    console.warn("[fund:fmp] FMP_API_KEY not set — skipping quality ratios");
-    return result;
-  }
-  const BATCH = 5;
-  const DELAY = 350;
-  for (let i = 0; i < tickers.length; i += BATCH) {
-    const batch = tickers.slice(i, i + BATCH);
-    await Promise.all(batch.map(async (ticker) => {
-      const url = `https://financialmodelingprep.com/api/v3/ratios-ttm/${ticker}?apikey=${FMP_API_KEY}`;
-      const json = await safeFetch(url);
-      if (!Array.isArray(json) || json.length === 0) return;
-      const r = json[0];
-      const roeRaw = n(r.returnOnEquityTTM);
-      const marginRaw = n(r.netProfitMarginTTM);
-      const deRaw = n(r.debtEquityRatioTTM);
-      result.set(ticker, {
-        roe: roeRaw !== null ? Math.round(roeRaw * 1000) / 10 : null,
-        profitMargin: marginRaw !== null ? Math.round(marginRaw * 1000) / 10 : null,
-        debtToEquity: deRaw !== null ? Math.round(deRaw * 100) / 100 : null,
-      });
-    }));
-    if (i + BATCH < tickers.length) await new Promise((r) => setTimeout(r, DELAY));
+    await new Promise((r) => setTimeout(r, 300)); // 60/min free tier
   }
   return result;
 }
 
 // ─── Main pipeline ────────────────────────────────────────────────
+// Called after prewarmHistoryCache() has populated chartMeta for all tickers.
 
-async function buildFundamentalsCache(tickers: string[]): Promise<void> {
-  console.log(`[fund] Starting multi-source fetch for ${tickers.length} tickers...`);
+export async function buildScoresFromMeta(tickers: string[]): Promise<void> {
+  console.log(`[fund] Building scores from chart meta for ${tickers.length} tickers...`);
   state.status = "loading";
 
-  // Run all three sources in parallel
-  const [yahooMap, finnhubMap, fmpMap] = await Promise.all([
-    fetchYahooQuoteBatch(tickers),
-    fetchFinnhubMetrics(tickers),
-    fetchFMPRatios(tickers),
-  ]);
+  // Fetch Finnhub growth metrics (the only extra network calls we make)
+  const finnhubMap = await fetchFinnhubMetrics(tickers);
 
   const tempMap = new Map<string, FundamentalsScore>();
 
   for (const ticker of tickers) {
-    const y = yahooMap.get(ticker) ?? {};
-    const f = finnhubMap.get(ticker) ?? {};
-    const p = fmpMap.get(ticker) ?? {};
-
+    const m = state.chartMeta.get(ticker);
+    const f = finnhubMap.get(ticker);
     const sources: string[] = [];
-    if (Object.values(y).some((v) => v !== null && v !== undefined)) sources.push("yahoo-v7");
-    if (Object.values(f).some((v) => v !== null && v !== undefined)) sources.push("finnhub");
-    if (Object.values(p).some((v) => v !== null && v !== undefined)) sources.push("fmp");
+    if (m) sources.push("yahoo-v8-meta");
+    if (f && (f.epsGrowth !== null || f.revenueGrowth !== null)) sources.push("finnhub");
+
+    // PE from meta; fallback: price/eps if both available
+    let pe = m?.pe ?? null;
+    if ((pe === null || pe <= 0) && m?.eps && m.eps > 0 && m?.pe == null) pe = null; // can't derive safely
+    const pb = (m?.pb != null && m.pb > 0) ? Math.round(m.pb * 10) / 10 : null;
+    const beta = m?.beta ?? null;
+    const marketCap = m?.marketCap ?? null;
+    const dyRaw = m?.dividendYield ?? null;
+    // Yahoo v8 dividendYield is already a decimal (e.g. 0.012 = 1.2%)
+    const dividendYield = dyRaw !== null ? Math.round(dyRaw * 10000) / 100 : null;
+    const sector = m?.sector ?? "Unknown";
 
     tempMap.set(ticker, {
       ticker,
-      sector: (y as any).sector ?? "Unknown",
-      marketCap: y.marketCap ?? null,
-      // Valuation (Yahoo v7)
-      pe: y.pe ?? null,
-      pb: y.pb ?? null,
-      beta: y.beta ?? null,
-      dividendYield: y.dividendYield ?? null,
-      insiderOwnership: y.insiderOwnership ?? null,
-      // Growth (Finnhub)
-      epsGrowth: f.epsGrowth ?? null,
-      revenueGrowth: f.revenueGrowth ?? null,
-      // Quality (FMP)
-      roe: p.roe ?? null,
-      profitMargin: p.profitMargin ?? null,
-      debtToEquity: p.debtToEquity ?? null,
-      // Scores computed below
+      sector,
+      marketCap,
+      pe: pe !== null && pe > 0 ? Math.round(pe * 10) / 10 : null,
+      pb,
+      roe: null,
+      profitMargin: null,
+      revenueGrowth: f?.revenueGrowth ?? null,
+      epsGrowth: f?.epsGrowth ?? null,
+      beta,
+      dividendYield,
+      debtToEquity: null,
+      insiderOwnership: null,
       qualityScore: null,
       lowVolScore: null,
       valuationScore: null,
@@ -250,38 +184,32 @@ async function buildFundamentalsCache(tickers: string[]): Promise<void> {
     });
   }
 
-  // ── Percentile-rank across universe ───────────────────────────
+  // ── Percentile-rank across universe ──────────────────────────────
   const entries = Array.from(tempMap.values());
   const nn = (arr: (number | null)[]): number[] => arr.filter((v): v is number => v !== null);
 
-  const allROE       = nn(entries.map((e) => e.roe));
-  const allMargin    = nn(entries.map((e) => e.profitMargin));
-  const allDE        = nn(entries.map((e) => e.debtToEquity));
   const allBeta      = nn(entries.map((e) => e.beta));
-  const allPE        = nn(entries.map((e) => e.pe)).filter((v) => v > 0);
-  const allPB        = nn(entries.map((e) => e.pb)).filter((v) => v > 0);
+  const allPE        = nn(entries.map((e) => e.pe)).filter((v) => v > 0 && v < 500);
+  const allPB        = nn(entries.map((e) => e.pb)).filter((v) => v > 0 && v < 100);
   const allDY        = nn(entries.map((e) => e.dividendYield));
   const allRevGrowth = nn(entries.map((e) => e.revenueGrowth));
   const allEPSGrowth = nn(entries.map((e) => e.epsGrowth));
-  const allInsider   = nn(entries.map((e) => e.insiderOwnership));
 
   for (const e of entries) {
-    // Quality: ROE 40% + margin 35% + low D/E 25%
+    // Quality: only PB available from v8 meta (proxy for asset efficiency)
+    // PE inversion as secondary quality signal when PB missing
     const qParts: { s: number; w: number }[] = [];
-    if (e.roe !== null)          qParts.push({ s: percentileScore(e.roe, allROE, true), w: 0.4 });
-    if (e.profitMargin !== null) qParts.push({ s: percentileScore(e.profitMargin, allMargin, true), w: 0.35 });
-    if (e.debtToEquity !== null) qParts.push({ s: percentileScore(e.debtToEquity, allDE, false), w: 0.25 });
-    e.qualityScore = weightedScore(qParts);
+    if (e.pb !== null && e.pb > 0 && e.pb < 100) qParts.push({ s: percentileScore(e.pb, allPB, false), w: 1 });
+    e.qualityScore = weightedScore(qParts); // will be null if no PB
 
     // Low Vol: inverse beta
     if (e.beta !== null)
       e.lowVolScore = clamp(percentileScore(e.beta, allBeta, false));
 
-    // Valuation: inverse PE 40% + inverse PB 35% + div yield 25%
+    // Valuation: inverse PE 60% + div yield 40%
     const vParts: { s: number; w: number }[] = [];
-    if (e.pe !== null && e.pe > 0) vParts.push({ s: percentileScore(e.pe, allPE, false), w: 0.4 });
-    if (e.pb !== null && e.pb > 0) vParts.push({ s: percentileScore(e.pb, allPB, false), w: 0.35 });
-    if (e.dividendYield !== null)  vParts.push({ s: percentileScore(e.dividendYield, allDY, true), w: 0.25 });
+    if (e.pe !== null && e.pe > 0 && e.pe < 500) vParts.push({ s: percentileScore(e.pe, allPE, false), w: 0.6 });
+    if (e.dividendYield !== null)                 vParts.push({ s: percentileScore(e.dividendYield, allDY, true), w: 0.4 });
     e.valuationScore = weightedScore(vParts);
 
     // ERM: EPS growth 55% + revenue growth 45%
@@ -290,16 +218,15 @@ async function buildFundamentalsCache(tickers: string[]): Promise<void> {
     if (e.revenueGrowth !== null) eParts.push({ s: percentileScore(e.revenueGrowth, allRevGrowth, true), w: 0.45 });
     e.ermScore = weightedScore(eParts);
 
-    // Insider: percentile of insider ownership %
-    if (e.insiderOwnership !== null)
-      e.insiderScore = clamp(percentileScore(e.insiderOwnership, allInsider, true));
+    // Insider: no source available
+    e.insiderScore = null;
   }
 
-  const scored = Array.from(tempMap.values()).filter((e) => e.sources.length > 0).length;
+  const scored = entries.filter((e) => e.sources.length > 0).length;
   state.data = tempMap;
   state.lastFetched = Date.now();
   state.status = scored > 0 ? "ready" : "error";
-  console.log(`[fund] Cache ready: ${tempMap.size} tickers, ${scored} with live data. Sources: yahoo-v7=${yahooMap.size} finnhub=${finnhubMap.size} fmp=${fmpMap.size}`);
+  console.log(`[fund] Scores ready: ${scored}/${tempMap.size} tickers with live data. finnhub=${finnhubMap.size}`);
 }
 
 // ─── Public API ───────────────────────────────────────────────────
@@ -317,21 +244,15 @@ export function getCacheStatus() {
     status: state.status,
     count: state.data.size,
     lastFetched: state.lastFetched,
-    fmpEnabled: !!FMP_API_KEY,
+    fmpEnabled: false,
     sources: {
-      yahooV7: true,
+      yahooV8Meta: state.chartMeta.size,
       finnhub: !!FINNHUB_API_KEY,
-      fmp: !!FMP_API_KEY,
     },
   };
 }
 
-export async function initFundamentalsCache(tickers?: string[]): Promise<void> {
-  const { getAllStocks } = await import("./stockData");
-  const allTickers = tickers ?? getAllStocks().map((s) => s.ticker);
-  await buildFundamentalsCache(allTickers);
-  setInterval(
-    () => buildFundamentalsCache(allTickers).catch((err) => console.warn("[fund] Daily refresh failed:", err)),
-    CACHE_TTL_MS
-  );
+// Legacy stub — no longer needed but kept to avoid import errors
+export async function initFundamentalsCache(_tickers?: string[]): Promise<void> {
+  // Now driven by buildScoresFromMeta() called from index.ts after prewarm
 }

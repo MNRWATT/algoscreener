@@ -1,98 +1,51 @@
-import express, { type Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
-import { serveStatic } from "./static";
+import express from "express";
 import { createServer } from "http";
+import { registerRoutes } from "./routes";
 import { prewarmCache, prewarmHistoryCache } from "./marketData";
-import { initFundamentalsCache } from "./fundamentalsCache";
+import { buildScoresFromMeta } from "./fundamentalsCache";
+import { getAllStocks } from "./stockData";
 
 const app = express();
-const httpServer = createServer(app);
-
-declare module "http" {
-  interface IncomingMessage {
-    rawBody: unknown;
-  }
-}
-
-app.use(
-  express.json({
-    verify: (req, _res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
-);
-
+app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-export function log(message: string, source = "express") {
-  const formattedTime = new Date().toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
+// Serve static frontend in production
+if (process.env.NODE_ENV === "production") {
+  const path = await import("path");
+  const { fileURLToPath } = await import("url");
+  const __dirname = path.default.dirname(fileURLToPath(import.meta.url));
+  app.use(express.static(path.default.join(__dirname, "../dist/public")));
+  app.get("*", (_req: any, res: any) => {
+    res.sendFile(path.default.join(__dirname, "../dist/public/index.html"));
   });
-  console.log(`${formattedTime} [${source}] ${message}`);
 }
 
-app.use((req, res, next) => {
-  const start = Date.now();
-  const path = req.path;
-  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+const httpServer = createServer(app);
+await registerRoutes(httpServer, app);
 
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
-
-  res.on("finish", () => {
-    const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-      log(logLine);
-    }
-  });
-
-  next();
+const PORT = parseInt(process.env.PORT || "5000", 10);
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log(`[express] serving on port ${PORT}`);
 });
 
+// Boot sequence:
+// 1. Finnhub quote prewarm (top 50 tickers, fast)
+// 2. Yahoo v8 chart prewarm — fetches price history AND stores chart meta
+// 3. Build factor scores from chart meta + Finnhub growth metrics
+
 (async () => {
-  await registerRoutes(httpServer, app);
+  try {
+    prewarmCache(); // non-blocking, Finnhub quotes
 
-  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
-    console.error("Internal Server Error:", err);
-    if (res.headersSent) return next(err);
-    return res.status(status).json({ message });
-  });
+    console.log("[boot] Starting Yahoo price history + chart meta prewarm...");
+    await prewarmHistoryCache(); // blocking — we need meta before scoring
 
-  if (process.env.NODE_ENV === "production") {
-    serveStatic(app);
-  } else {
-    const { setupVite } = await import("./vite");
-    await setupVite(httpServer, app);
+    console.log("[boot] Building fundamentals scores from chart meta...");
+    const tickers = getAllStocks().map((s) => s.ticker);
+    await buildScoresFromMeta(tickers);
+
+    console.log("[boot] All data ready.");
+  } catch (err) {
+    console.warn("[boot] Non-fatal startup error:", err);
   }
-
-  const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    { port, host: "0.0.0.0", reusePort: true },
-    () => {
-      log(`serving on port ${port}`);
-
-      // Startup sequence (fire-and-forget, non-blocking):
-      // 1. Init FMP fundamentals cache (Quality, Valuation, ERM, Insider scores)
-      // 2. Warm Finnhub live quote cache for top 50 tickers
-      // 3. Pre-warm Yahoo 24M price history for ALL tickers — computes real
-      //    Momentum returns + 52W volatility, then invalidates stock score cache
-      //    so screener + stock detail both use real data on next request.
-      initFundamentalsCache()
-        .then(() => prewarmCache())
-        .then(() => prewarmHistoryCache())
-        .catch((err) => console.warn("[startup] cache init failed (non-fatal):", err));
-    },
-  );
 })();
