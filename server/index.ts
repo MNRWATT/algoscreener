@@ -2,7 +2,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
-import { prewarmCache } from "./marketData";
+import { prewarmCache, prewarmHistoryCache } from "./marketData";
 import { initFundamentalsCache } from "./fundamentalsCache";
 
 const app = express();
@@ -83,10 +83,15 @@ app.use((req, res, next) => {
     () => {
       log(`serving on port ${port}`);
 
-      // Fire-and-forget: init FMP fundamentals cache first (real factor scores)
-      // then warm Finnhub price cache for top tickers
+      // Startup sequence (fire-and-forget, non-blocking):
+      // 1. Init FMP fundamentals cache (Quality, Valuation, ERM, Insider scores)
+      // 2. Warm Finnhub live quote cache for top 50 tickers
+      // 3. Pre-warm Yahoo 24M price history for ALL tickers — computes real
+      //    Momentum returns + 52W volatility, then invalidates stock score cache
+      //    so screener + stock detail both use real data on next request.
       initFundamentalsCache()
         .then(() => prewarmCache())
+        .then(() => prewarmHistoryCache())
         .catch((err) => console.warn("[startup] cache init failed (non-fatal):", err));
     },
   );
